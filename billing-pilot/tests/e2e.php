@@ -111,4 +111,33 @@ catch (\FOSSBilling\Exception $e) { $denied = true; }
 check($denied, 'Other client accessed generated credentials');
 check(mock()['clones'] === $before + 2, 'Password activation created duplicate VM');
 echo "PASS: key and password orders; unpaid isolation, paid activation, credential ownership, retry, suspend/resume, retained disk\n";
+
+require '/opt/pilot/PortalBridge.php';
+$bridge = new PortalBridge(new FossPortal($di), '/var/www/html/data/portal');
+$reference = 'aaaaaaaa-aaaa-4aaa-8aaa-' . bin2hex(random_bytes(6));
+$account = 'bbbbbbbb-bbbb-4bbb-8bbb-' . bin2hex(random_bytes(6));
+$request = ['action' => 'create', 'reference' => $reference, 'account' => $account, 'plan' => 'mini'];
+$beforePortal = mock()['clones'];
+$created = $bridge->handle($request); echo "Portal created\n";
+check($created['phase'] === 'ready', 'Portal VM not SSH-ready');
+check($created === $bridge->handle($request), 'Portal retry differs');
+check(mock()['clones'] === $beforePortal + 1, 'Portal duplicated VM');
+$free = $api->order_get(['id' => $created['order_id']]);
+check((float) $free['price'] === 0.0 && !$free['unpaid_invoice_id'], 'Free order created a charge');
+$request['action'] = 'password';
+check(strlen($bridge->handle($request)['password']) >= 28, 'Portal password missing'); echo "Portal credentials verified\n";
+$request['action'] = 'stop';check($bridge->handle($request)['phase'] === 'suspended', 'Portal stop did not suspend billing');
+$request['action'] = 'start';check($bridge->handle($request)['phase'] === 'ready', 'Portal start failed');
+$context = stream_context_create(['http' => ['ignore_errors' => true]]);
+file_get_contents('http://127.0.0.1/portal.php', false, $context);
+check(str_contains(http_get_last_response_headers()[0], '401'), 'Anonymous portal access allowed');
+$context = stream_context_create(['http' => ['ignore_errors' => true, 'method' => 'POST', 'header' => 'Content-Type: application/json'."\r\n".'Authorization: Bearer '.getenv('PORTAL_BRIDGE_TOKEN'), 'content' => '{}']]);
+$invalid = file_get_contents('http://127.0.0.1/portal.php', false, $context);
+check(str_contains(http_get_last_response_headers()[0], '400') && str_contains($invalid, 'Invalid request'), 'Service authentication/header routing broken');
+$context = stream_context_create(['http' => ['ignore_errors' => true, 'method' => 'POST', 'header' => 'Content-Type: application/json'."\r\n".'Authorization: Bearer '.getenv('PORTAL_BRIDGE_TOKEN'), 'content' => json_encode(['action'=>'status','account'=>$account,'reference'=>$reference])]]);
+// The authenticated HTTP endpoint must recover the same persisted mapping.
+$status = json_decode(file_get_contents('http://127.0.0.1/portal.php', false, $context), true);
+check(str_contains(http_get_last_response_headers()[0], '200') && $status['order_id'] === $created['order_id'] && !isset($status['password']), 'HTTP status contract failed');
+echo "PASS: real FOSSBilling bridge -> zero-price order -> one VM -> password -> stop/start, anonymous denial
+";
 $completed = true;

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
 import shutil
 import sqlite3
 import struct
@@ -105,6 +106,22 @@ class Proxmox:
 
     def resize(self, vmid, gb):
         run(['/usr/sbin/qm', 'disk', 'resize', str(vmid), 'scsi0', str(gb) + 'G'])
+
+    def ready(self, vmid, ip):
+        try:
+            result = subprocess.run(['/usr/sbin/qm', 'guest', 'exec', str(vmid), '--timeout', '10',
+                                     '--', 'cloud-init', 'status', '--format', 'json'],
+                                    capture_output=True, text=True, timeout=15)
+            if result.returncode != 0:
+                return False
+            guest = json.loads(result.stdout)
+            cloud = json.loads(guest.get('out-data', '{}'))
+            if guest.get('exitcode') != 0 or cloud.get('status') != 'done':
+                return False
+            with socket.create_connection((ip, 22), timeout=2) as connection:
+                return connection.recv(128).startswith(b'SSH-2.0-')
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return False
 
 
 class Engine:
@@ -250,7 +267,7 @@ class Engine:
         if spec['ssh_key'] is None:
             credential = self.db.execute('SELECT password_hash FROM credential WHERE order_id=?', (row['order_id'],)).fetchone()
             require(credential is not None, 'Не найден пароль закреплённого VPS; нужна проверка администратором')
-            cloud['users'][0]['ssh_authorized_keys'] = []
+            del cloud['users'][0]['ssh_authorized_keys']
             # Ubuntu's set_passwords runs before SSH, and expires the hash before enabling password auth.
             cloud['chpasswd'] = {'expire': True, 'users': [
                 {'name': 'vpsadmin', 'type': 'hash', 'password': credential['password_hash']}]}
@@ -296,7 +313,7 @@ class Engine:
     def handle(self, request):
         require(isinstance(request, dict), 'Ожидается JSON object')
         action = request.get('action')
-        require(action in ('create', 'status', 'password', 'suspend', 'unsuspend', 'cancel'), 'Недопустимая операция')
+        require(action in ('create', 'status', 'readiness', 'password', 'suspend', 'unsuspend', 'cancel'), 'Недопустимая операция')
         order, client = request.get('order_id'), request.get('client_id')
         require(type(order) is int and 1 <= order < 2147483647 and type(client) is int and 1 <= client < 2147483647,
                 'Нужны целочисленные order_id и client_id')
@@ -320,6 +337,11 @@ class Engine:
             return self.initial_password(row)
         if action == 'status':
             return self.info(row)
+        if action == 'readiness':
+            info = self.info(row)
+            info['ready'] = (row['phase'] == 'ready' and info['status'] == 'running'
+                             and self.pve.ready(self.vmid(row), info['private_ip']))
+            return info
         require(row['phase'] != 'cancelled' or action == 'cancel', 'Заказ отменён; операция запрещена')
         require(row['phase'] in ('ready', 'suspended', 'cancelled'), 'Создание не завершено; сначала повторите активацию')
         require(action != 'unsuspend' or row['phase'] != 'cancelled', 'Заказ отменён; запуск запрещён')

@@ -71,6 +71,11 @@ class SafehostProxmox
         return $this->request('password', $order);
     }
 
+    public function readiness(array $data, array $order, array $params = []): array
+    {
+        return $this->request('readiness', $order);
+    }
+
     private function assertLifecycle(array $params): void
     {
         // Pinned 0.8.8: lifecycle callOnAdapter supplies []. Client/Admin customCall

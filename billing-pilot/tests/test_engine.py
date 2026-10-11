@@ -22,8 +22,12 @@ class FakePVE:
                            'net0': 'virtio=00:00:00:00:00:00,bridge=vmbr1', 'scsi0': 'local-lvm:base-9000-disk-0,size=4G'}}
         self.states = {9000: 'stopped'}
         self.calls = []
+        self.is_ready = True
         self.crash_after_clone = False
         self.crash_after_start = False
+
+    def ready(self, vmid, ip):
+        return self.is_ready
 
     def guests(self):
         return {i: {'vmid': i, 'node': 'pve1', 'type': v.get('_type', 'qemu')} for i,v in self.vms.items()}
@@ -72,6 +76,17 @@ class CLIContracts(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_readiness_requires_cloud_init_and_ssh_and_owner(self):
+        self.handle('create')
+        self.pve.is_ready = False
+        self.assertFalse(self.handle('readiness')['ready'])
+        self.pve.is_ready = True
+        self.assertTrue(self.handle('readiness')['ready'])
+        with self.assertRaises(engine.Refused):
+            self.handle('readiness', client_id=3)
+        self.handle('suspend')
+        self.assertFalse(self.handle('readiness')['ready'])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.config = json.loads((ROOT / 'config.json').read_text())
@@ -189,6 +204,7 @@ class EngineTests(unittest.TestCase):
         snippet = Path(self.temp.name) / 'snippets/safehost-billing-1100.yaml'
         cloud = json.loads(snippet.read_text().split('\n', 1)[1])
         self.assertTrue(cloud['ssh_pwauth'])
+        self.assertNotIn('ssh_authorized_keys', cloud['users'][0])
         self.assertTrue(cloud['users'][0]['lock_passwd'])
         self.assertNotIn('hashed_passwd', cloud['users'][0])
         self.assertTrue(cloud['chpasswd']['expire'])

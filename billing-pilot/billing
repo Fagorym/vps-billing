@@ -54,6 +54,19 @@ def prepare():
                  'admin_email': 'admin@example.test'}
         credentials.write_text(json.dumps(value, indent=2) + '\n')
         env.write_text('MARIADB_PASSWORD=' + value['database_password'] + '\n')
+    token_file = ROOT / '.secrets/portal-token'
+    if token_file.is_symlink():
+        raise ValueError('Portal token не должен быть symlink')
+    text = env.read_text()
+    configured = next((line.split('=', 1)[1] for line in text.splitlines() if line.startswith('PORTAL_BRIDGE_TOKEN=')), None)
+    if not token_file.exists():
+        token_file.write_text((configured or secrets.token_hex(32)) + '\n')
+    token_file.chmod(0o600)
+    token = token_file.read_text().strip()
+    if len(token) < 32 or configured is not None and configured != token:
+        raise ValueError('Portal token и .env не совпадают; восстановите исходный секрет')
+    if configured is None:
+        env.write_text(text.rstrip() + '\nPORTAL_BRIDGE_TOKEN=' + token + '\n')
     credentials.chmod(0o600)
     env.chmod(0o600)
     for key in (ROOT / '.secrets/admin_ed25519', ROOT / '.secrets/transport/id_ed25519'):
@@ -86,7 +99,7 @@ def install_local():
             input=(ROOT / '.secrets/bootstrap.json').read_text(), text=True)
     compose('exec', '-T', 'billing', 'sh', '-ec',
             'mkdir -p /var/www/html/library/Plugin/SafehostProxmox /var/www/html/modules/Servicecustom/templates/client; '
-            'cp /opt/pilot/SafehostProxmox.php /var/www/html/library/Plugin/SafehostProxmox/; '
+            'php /opt/pilot/install-portal.php; cp /opt/pilot/SafehostProxmox.php /var/www/html/library/Plugin/SafehostProxmox/; '
             'cp /opt/pilot/mod_servicecustom_manage.html.twig /var/www/html/modules/Servicecustom/templates/client/; '
             'chown -R www-data:www-data /var/www/html/library/Plugin/SafehostProxmox /var/www/html/modules/Servicecustom/templates/client /var/www/html/data', demo=True)
     compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/opt/pilot/seed.php', demo=True)
@@ -207,6 +220,7 @@ def main():
                      ROOT / 'ansible/expand.yml', '--syntax-check'], cwd=ROOT, env=ansible_env())
         install_local()
         if args.action == 'test':
+            compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/portal-unit.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/e2e.php', demo=True)
             compose('down', '-v', demo=True)
             print('Тестовый проект и его временные volumes удалены. Данные demo и сервера сохранены.', flush=True)

@@ -57,13 +57,20 @@
         src: "{{ billing_root }}/{{ item }}"
         dest: /opt/billing-pilot/
         mode: preserve
-      loop: [docker, fossbilling]
+      loop: [docker, fossbilling, compose.yml]
+    - name: Передать секрет серверной интеграции без изменения пароля БД
+      ansible.builtin.lineinfile:
+        path: /opt/billing-pilot/.env
+        regexp: '^PORTAL_BRIDGE_TOKEN='
+        line: "PORTAL_BRIDGE_TOKEN={{ lookup('file', portal_token_file | default(billing_root + '/.secrets/portal-token')) | trim }}"
+        mode: '0600'
+      no_log: true
     - name: Пересобрать только приложение биллинга
       ansible.builtin.command: "{{ compose }} up -d --build --wait billing"
       async: 1800
       poll: 10
     - name: Обновить плагин и экран доступа в постоянном volume
       ansible.builtin.command:
-        argv: [docker, compose, -p, safehost-billing, --project-directory, /opt/billing-pilot, -f, /opt/billing-pilot/compose.yml, exec, -T, billing, sh, -ec, 'cp /opt/pilot/SafehostProxmox.php /var/www/html/library/Plugin/SafehostProxmox/; cp /opt/pilot/mod_servicecustom_manage.html.twig /var/www/html/modules/Servicecustom/templates/client/; chown www-data:www-data /var/www/html/library/Plugin/SafehostProxmox/SafehostProxmox.php /var/www/html/modules/Servicecustom/templates/client/mod_servicecustom_manage.html.twig']
+        argv: [docker, compose, -p, safehost-billing, --project-directory, /opt/billing-pilot, -f, /opt/billing-pilot/compose.yml, exec, -T, billing, sh, -ec, 'php /opt/pilot/install-portal.php; cp /opt/pilot/SafehostProxmox.php /var/www/html/library/Plugin/SafehostProxmox/; cp /opt/pilot/mod_servicecustom_manage.html.twig /var/www/html/modules/Servicecustom/templates/client/; chown www-data:www-data /var/www/html/library/Plugin/SafehostProxmox/SafehostProxmox.php /var/www/html/modules/Servicecustom/templates/client/mod_servicecustom_manage.html.twig']
     - name: Обновить поле существующей формы заказа
       ansible.builtin.command: "{{ compose }} exec -T --user 33:33 billing php /opt/pilot/seed.php"

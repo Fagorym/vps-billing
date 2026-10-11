@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    environment:
+      PORTAL_BRIDGE_TOKEN: ${PORTAL_BRIDGE_TOKEN:-}
     restart: unless-stopped
     ports:
       - "127.0.0.1:8088:80"
