@@ -1,0 +1,45 @@
+---
+- name: Расширить установленный пул VPS с пяти до десяти мест
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    ansible_ssh_private_key_file: "{{ pilot_host_key }}"
+    ansible_ssh_args: "-o ControlMaster=no -o ControlPath=none -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+    ansible_ssh_common_args: "-o UserKnownHostsFile={{ pilot_known_hosts | quote }} -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+  tasks:
+    - name: Создать временный закрытый каталог миграции
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: safehost-pool-
+      register: staging
+    - name: Передать и выполнить проверяемую миграцию
+      block:
+        - name: Передать отдельный скрипт расширения
+          ansible.builtin.copy:
+            src: "{{ billing_root }}/backend/expand_pool.py"
+            dest: "{{ staging.path }}/expand_pool.py"
+            mode: '0600'
+        - name: Передать желаемую конфигурацию
+          ansible.builtin.copy:
+            content: "{{ engine | to_nice_json }}\n"
+            dest: "{{ staging.path }}/desired.json"
+            mode: '0600'
+        - name: Подготовить NAT для десяти слотов без применения
+          ansible.builtin.template:
+            src: nat.sh.j2
+            dest: "{{ staging.path }}/nat.sh"
+            mode: '0600'
+            validate: /bin/sh -n %s
+        - name: Сохранить состояние и расширить пул под блокировкой адаптера
+          ansible.builtin.command:
+            argv: [/usr/bin/python3, "{{ staging.path }}/expand_pool.py", --desired, "{{ staging.path }}/desired.json", --nat-script, "{{ staging.path }}/nat.sh"]
+          register: expansion
+          changed_when: (expansion.stdout | from_json).changed
+        - name: Показать итог миграции
+          ansible.builtin.debug:
+            var: expansion.stdout
+      always:
+        - name: Удалить только временные файлы этой миграции
+          ansible.builtin.file:
+            path: "{{ staging.path }}"
+            state: absent

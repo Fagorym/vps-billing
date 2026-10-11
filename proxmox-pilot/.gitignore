@@ -1,0 +1,6 @@
+.venv/
+.state/
+.secrets/
+__pycache__/
+*.pyc
+*.retry

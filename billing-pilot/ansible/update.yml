@@ -1,0 +1,69 @@
+---
+- name: Обновить установленный адаптер без изменения VM и сети
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    ansible_ssh_private_key_file: "{{ pilot_host_key }}"
+    ansible_ssh_common_args: "-o UserKnownHostsFile={{ pilot_known_hosts | quote }} -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+  tasks:
+    - name: Убедиться, что пилот уже установлен
+      ansible.builtin.stat:
+        path: /usr/local/lib/safehost-billing/engine.py
+      register: adapter
+    - name: Отказаться от обновления неустановленного пилота
+      ansible.builtin.assert:
+        that: adapter.stat.exists
+    - name: Создать каталог резервной копии адаптера
+      ansible.builtin.file:
+        path: /root/safehost-password-backup
+        state: directory
+        mode: '0700'
+    - name: Сохранить исходный адаптер один раз
+      ansible.builtin.copy:
+        remote_src: true
+        src: /usr/local/lib/safehost-billing/engine.py
+        dest: /root/safehost-password-backup/engine.py
+        force: false
+        mode: '0600'
+    - name: Установить зависимости выдачи паролей
+      ansible.builtin.apt:
+        name: [python3-cryptography, openssl]
+        state: present
+    - name: Обновить ограниченный адаптер
+      ansible.builtin.copy:
+        src: "{{ billing_root }}/backend/engine.py"
+        dest: /usr/local/lib/safehost-billing/engine.py
+        mode: '0755'
+    - name: Добавить установленную VM биллинга
+      ansible.builtin.add_host:
+        name: billing_vm
+        groups: billing_update
+        ansible_host: 80.249.131.4
+        ansible_port: 2223
+        ansible_user: vpsadmin
+        ansible_ssh_private_key_file: "{{ pilot_guest_key }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: "-o UserKnownHostsFile={{ pilot_known_hosts | quote }} -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+
+- name: Обновить FOSSBilling и сделать SSH-ключ необязательным
+  hosts: billing_update
+  gather_facts: false
+  become: true
+  vars:
+    compose: docker compose -p safehost-billing --project-directory /opt/billing-pilot -f /opt/billing-pilot/compose.yml
+  tasks:
+    - name: Передать исходники приложения
+      ansible.builtin.copy:
+        src: "{{ billing_root }}/{{ item }}"
+        dest: /opt/billing-pilot/
+        mode: preserve
+      loop: [docker, fossbilling]
+    - name: Пересобрать только приложение биллинга
+      ansible.builtin.command: "{{ compose }} up -d --build --wait billing"
+      async: 1800
+      poll: 10
+    - name: Обновить плагин и экран доступа в постоянном volume
+      ansible.builtin.command:
+        argv: [docker, compose, -p, safehost-billing, --project-directory, /opt/billing-pilot, -f, /opt/billing-pilot/compose.yml, exec, -T, billing, sh, -ec, 'cp /opt/pilot/SafehostProxmox.php /var/www/html/library/Plugin/SafehostProxmox/; cp /opt/pilot/mod_servicecustom_manage.html.twig /var/www/html/modules/Servicecustom/templates/client/; chown www-data:www-data /var/www/html/library/Plugin/SafehostProxmox/SafehostProxmox.php /var/www/html/modules/Servicecustom/templates/client/mod_servicecustom_manage.html.twig']
+    - name: Обновить поле существующей формы заказа
+      ansible.builtin.command: "{{ compose }} exec -T --user 33:33 billing php /opt/pilot/seed.php"

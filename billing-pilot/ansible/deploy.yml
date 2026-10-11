@@ -1,0 +1,257 @@
+---
+- name: Подготовить отдельную VM биллинга и ограниченный адаптер на Proxmox
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    pilot: "{{ billing_vm_config }}"
+    ansible_ssh_private_key_file: "{{ pilot_host_key }}"
+    ansible_ssh_common_args: "-o UserKnownHostsFile={{ pilot_known_hosts | quote }} -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+  tasks:
+    - name: Проверить конфигурацию и VMID биллинга без изменений
+      billing_vm_guard:
+        config: "{{ pilot }}"
+        public_key: "{{ lookup('file', pilot_guest_key + '.pub') | trim }}"
+
+    - name: Проверить занятость портов, IP и принадлежность NAT-цепочек
+      ansible.builtin.script:
+        cmd: "{{ billing_root }}/ansible/preflight.py --slots {{ engine.slots }}"
+        executable: /usr/bin/python3
+
+    - name: Установить зависимости выдачи паролей
+      ansible.builtin.apt:
+        name: [python3-cryptography, openssl]
+        state: present
+
+    - name: Создать каталоги адаптера
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: /usr/local/lib/safehost-billing, mode: '0755'}
+        - {path: /etc/safehost-billing, mode: '0700'}
+        - {path: /var/lib/safehost-billing, mode: '0700'}
+
+    - name: Проверить неизменность уже установленного пула
+      ansible.builtin.stat:
+        path: /etc/safehost-billing/config.json
+      register: existing_engine
+
+    - name: Прочитать конфигурацию существующего пула
+      ansible.builtin.slurp:
+        src: /etc/safehost-billing/config.json
+      register: saved_engine
+      when: existing_engine.stat.exists
+
+    - name: Отказаться от автоматической миграции пула
+      ansible.builtin.assert:
+        that:
+          - saved_engine.content | b64decode | from_json == engine
+        fail_msg: Конфигурация пула изменилась. Нужна отдельная миграция; сеть и VM не меняем.
+      when: existing_engine.stat.exists
+
+    - name: Сохранить ограниченный адаптер
+      ansible.builtin.copy:
+        src: "{{ billing_root }}/backend/engine.py"
+        dest: /usr/local/lib/safehost-billing/engine.py
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Сохранить конфигурацию пула
+      ansible.builtin.copy:
+        content: "{{ engine | to_nice_json }}\n"
+        dest: /etc/safehost-billing/config.json
+        mode: '0600'
+
+    - name: Добавить ключ с forced command и запретом туннелей
+      ansible.builtin.lineinfile:
+        path: /root/.ssh/authorized_keys
+        line: 'restrict,from="10.10.10.11",command="/usr/bin/python3 /usr/local/lib/safehost-billing/engine.py" {{ lookup("file", billing_root + "/.secrets/transport/id_ed25519.pub") | trim }}'
+        mode: '0600'
+
+    - name: Сохранить отдельный NAT биллинга и пула VPS
+      ansible.builtin.template:
+        src: nat.sh.j2
+        dest: /usr/local/sbin/safehost-billing-nat
+        mode: '0750'
+        validate: /bin/sh -n %s
+
+    - name: Сохранить сервис NAT
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/safehost-billing-nat.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Safehost billing pilot NAT
+          After=network-online.target proxmox-pilot-nat.service
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/safehost-billing-nat
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Применить NAT и включить при загрузке
+      ansible.builtin.systemd_service:
+        name: safehost-billing-nat
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+    - name: Сохранить cloud-init биллинга
+      ansible.builtin.template:
+        src: "{{ pilot_root }}/roles/vps/templates/user-data.yml.j2"
+        dest: /var/lib/vz/snippets/proxmox-pilot-101-user.yaml
+        mode: '0644'
+      vars:
+        pilot_guest_public_key: "{{ lookup('file', pilot_guest_key + '.pub') | trim }}"
+
+    - name: Создать VM 101 из проверенного шаблона
+      pilot_vm:
+        config: "{{ pilot }}"
+        public_key: "{{ lookup('file', pilot_guest_key + '.pub') | trim }}"
+
+    - name: Получить доверенный SSH host key биллинга через guest agent
+      ansible.builtin.command:
+        argv: [qm, guest, exec, '101', --timeout, '30', --, cat, /etc/ssh/ssh_host_ed25519_key.pub]
+      register: guest_hostkey
+      changed_when: false
+      until: guest_hostkey.rc == 0 and (guest_hostkey.stdout | from_json).get('exitcode', -1) == 0
+      retries: 60
+      delay: 10
+
+    - name: Проверить формат ключа
+      ansible.builtin.assert:
+        that:
+          - (guest_hostkey.stdout | from_json)['out-data'] is match('^ssh-ed25519 [A-Za-z0-9+/=]+( |\n|$)')
+
+    - name: Закрепить SSH host key VM биллинга
+      ansible.builtin.known_hosts:
+        path: "{{ pilot_known_hosts }}"
+        name: '[80.249.131.4]:2223'
+        key: "[80.249.131.4]:2223 {{ ((guest_hostkey.stdout | from_json)['out-data']).split()[:2] | join(' ') }}"
+      delegate_to: localhost
+
+    - name: Прочитать SSH host key Proxmox для forced command
+      ansible.builtin.command: cat /etc/ssh/ssh_host_ed25519_key.pub
+      register: pve_hostkey
+      changed_when: false
+
+    - name: Сохранить trusted known_hosts адаптера
+      ansible.builtin.copy:
+        content: "10.10.10.1 {{ pve_hostkey.stdout.split()[:2] | join(' ') }}\n"
+        dest: "{{ billing_root }}/.secrets/transport/known_hosts"
+        mode: '0600'
+      delegate_to: localhost
+
+    - name: Добавить VM биллинга в inventory
+      ansible.builtin.add_host:
+        name: billing_vm
+        groups: billing_guests
+        ansible_host: 80.249.131.4
+        ansible_port: 2223
+        ansible_user: vpsadmin
+        ansible_ssh_private_key_file: "{{ pilot_guest_key }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: "-o UserKnownHostsFile={{ pilot_known_hosts | quote }} -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+
+- name: Установить FOSSBilling в VM биллинга
+  hosts: billing_guests
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Дождаться SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Дождаться cloud-init
+      ansible.builtin.command: cloud-init status --wait
+      async: 600
+      poll: 10
+      changed_when: false
+
+    - name: Установить Docker в Ubuntu VM
+      ansible.builtin.apt:
+        name: [docker.io, docker-compose-v2]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Включить Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Создать каталог пилота
+      ansible.builtin.file:
+        path: /opt/billing-pilot
+        state: directory
+        mode: '0700'
+
+    - name: Передать только файлы приложения
+      ansible.builtin.copy:
+        src: "{{ billing_root }}/{{ item }}"
+        dest: '/opt/billing-pilot/'
+        mode: preserve
+      loop: [compose.yml, .dockerignore, docker, fossbilling, config.json]
+
+    - name: Создать каталог ключа транспорта
+      ansible.builtin.file:
+        path: /opt/billing-pilot/.secrets/transport
+        state: directory
+        owner: '33'
+        group: '33'
+        mode: '0700'
+
+    - name: Передать ключ только ограниченного транспорта
+      ansible.builtin.copy:
+        src: "{{ billing_root }}/.secrets/transport/{{ item }}"
+        dest: '/opt/billing-pilot/.secrets/transport/'
+        owner: '33'
+        group: '33'
+        mode: '0400'
+      loop: [id_ed25519, known_hosts]
+      no_log: true
+
+    - name: Передать случайный пароль БД
+      ansible.builtin.copy:
+        src: "{{ billing_root }}/.env"
+        dest: /opt/billing-pilot/.env
+        mode: '0600'
+      no_log: true
+
+    - name: Запустить контейнеры
+      ansible.builtin.command: docker compose -p safehost-billing up -d --build --wait
+      args:
+        chdir: /opt/billing-pilot
+      async: 1800
+      poll: 10
+
+    - name: Установить FOSSBilling штатным установщиком
+      ansible.builtin.command:
+        argv: [docker, compose, -p, safehost-billing, exec, -T, --user, "33:33", billing, php, /opt/pilot/install.php]
+        stdin: "{{ lookup('file', billing_root + '/.secrets/bootstrap.json') }}"
+      args:
+        chdir: /opt/billing-pilot
+      no_log: true
+
+    - name: Установить адаптер в persistent volume
+      ansible.builtin.command:
+        argv: [docker, compose, -p, safehost-billing, exec, -T, billing, sh, -ec, 'mkdir -p /var/www/html/library/Plugin/SafehostProxmox /var/www/html/modules/Servicecustom/templates/client; cp /opt/pilot/SafehostProxmox.php /var/www/html/library/Plugin/SafehostProxmox/; cp /opt/pilot/mod_servicecustom_manage.html.twig /var/www/html/modules/Servicecustom/templates/client/; chown -R www-data:www-data /var/www/html/library/Plugin/SafehostProxmox /var/www/html/modules/Servicecustom/templates/client /var/www/html/data']
+      args:
+        chdir: /opt/billing-pilot
+
+    - name: Создать тестовый каталог и отключить исходящие письма
+      ansible.builtin.command: docker compose -p safehost-billing exec -T --user 33:33 billing php /opt/pilot/seed.php
+      args:
+        chdir: /opt/billing-pilot
+
+    - name: Проверить HTTP биллинга внутри VM
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8088/
+        status_code: 200

@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""One entry point. Passwords stay in OpenSSH's interactive prompt."""
+import argparse
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def execute(argv, **kwargs):
+    return subprocess.run([str(arg) for arg in argv], check=True, **kwargs)
+
+
+def bootstrap():
+    python = ROOT / ".venv/bin/python"
+    if not python.exists():
+        candidates = [os.environ.get("PILOT_PYTHON"), shutil.which("python3.13"),
+                      shutil.which("python3.12"), sys.executable,
+                      str(Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3")]
+        for candidate in dict.fromkeys(c for c in candidates if c):
+            probe = subprocess.run([candidate, "-c", "import ssl, venv, xml.parsers.expat; import sys; assert sys.version_info >= (3, 12)"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) if Path(candidate).exists() else None
+            if probe and probe.returncode == 0:
+                print("Создаю локальное Python-окружение.", flush=True)
+                execute([candidate, "-m", "venv", ROOT / ".venv"])
+                break
+        else:
+            raise ValueError("Нужен исправный Python 3.12+. Укажите PILOT_PYTHON=/путь/к/python3.")
+    if Path(sys.prefix).resolve() != (ROOT / ".venv").resolve():
+        os.execv(str(python), [str(python), str(ROOT / "pilot"), *sys.argv[1:]])
+    versions = {"ansible-core": "2.21.5", "PyYAML": "6.0.3"}
+    try:
+        ready = all(importlib.metadata.version(package) == version for package, version in versions.items())
+    except importlib.metadata.PackageNotFoundError:
+        ready = False
+    if not ready:
+        execute([python, "-m", "pip", "install", "--no-cache-dir", "-r", ROOT / "requirements.txt"])
+
+
+def secure_directory(path):
+    if path.is_symlink():
+        raise ValueError("Каталог состояния не должен быть symlink: " + str(path))
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+
+
+def keys():
+    secure_directory(ROOT / ".secrets")
+    secure_directory(ROOT / ".state")
+    for name in ("host_ed25519", "vps_ed25519"):
+        key = ROOT / ".secrets" / name
+        if key.is_symlink() or key.with_suffix(".pub").is_symlink():
+            raise ValueError("SSH key не должен быть symlink")
+        if not key.exists():
+            execute(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "proxmox-pilot-" + name,
+                     "-f", key])
+        key.chmod(0o600)
+        if not key.with_suffix(".pub").exists():
+            output = execute(["ssh-keygen", "-y", "-f", key], capture_output=True, text=True).stdout
+            key.with_suffix(".pub").write_text(output, encoding="utf-8")
+    known = ROOT / ".state/known_hosts"
+    if known.is_symlink():
+        raise ValueError("known_hosts не должен быть symlink")
+    known.touch(mode=0o600, exist_ok=True)
+    known.chmod(0o600)
+
+
+def ssh_options(key, known, strict="yes"):
+    return ["-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "UserKnownHostsFile=" + str(known),
+            "-o", "StrictHostKeyChecking=" + strict, "-o", "ConnectTimeout=15"]
+
+
+def authorize(host, known):
+    target = host["ansible_user"] + "@" + host["ansible_host"]
+    key = ROOT / ".secrets/host_ed25519"
+    common = ["ssh", *ssh_options(key, known), "-p", str(host["ansible_port"])]
+    probe = subprocess.run([*common, "-o", "BatchMode=yes", target, "command -v qm >/dev/null && test -d /etc/pve"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if probe.returncode == 0:
+        return
+    print("Первый вход: проверьте SSH fingerprint и введите пароль root в запрос OpenSSH.", flush=True)
+    script = ("set -eu; command -v qm >/dev/null; test -d /etc/pve; "
+              "umask 077; mkdir -p /root/.ssh; touch /root/.ssh/authorized_keys; "
+              "IFS= read -r key; case \"$key\" in ssh-ed25519\\ *) ;; *) exit 2;; esac; "
+              "grep -qxF -- \"$key\" /root/.ssh/authorized_keys || printf '%s\\n' \"$key\" >> /root/.ssh/authorized_keys")
+    public = key.with_suffix(".pub").read_text(encoding="utf-8").strip() + "\n"
+    execute(["ssh", *ssh_options(key, known, "ask"), "-p", str(host["ansible_port"]), target,
+             "sh -c " + shlex.quote(script)], input=public, text=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Пилот Proxmox: подготовка хоста и VPS одной командой")
+    parser.add_argument("action", choices=("up", "preflight", "validate", "ssh"))
+    args = parser.parse_args()
+    bootstrap()
+    import yaml
+    config = yaml.safe_load((ROOT / "group_vars/proxmox.yml").read_text(encoding="utf-8"))["pilot"]
+    inventory = yaml.safe_load((ROOT / "inventory.yml").read_text(encoding="utf-8"))
+    hosts = inventory["all"]["children"]["proxmox"]["hosts"]
+    if len(hosts) != 1:
+        raise ValueError("Этот пилот поддерживает один хост")
+    host = next(iter(hosts.values()))
+    if host["ansible_host"] != config["public_ip"] or host["ansible_user"] != "root":
+        raise ValueError("inventory должен указывать root и public_ip из конфигурации")
+    secure_directory(ROOT / ".state")
+    env = os.environ.copy()
+    env.update(ANSIBLE_CONFIG=str(ROOT / "ansible.cfg"), ANSIBLE_LOCAL_TEMP=str(ROOT / ".state/tmp"),
+               ANSIBLE_SSH_CONTROL_PATH_DIR=str(ROOT / ".state/cp"), ANSIBLE_HOME=str(ROOT / ".state/ansible"),
+               ANSIBLE_HOST_KEY_CHECKING="True")
+    playbook = [ROOT / ".venv/bin/ansible-playbook", "-i", ROOT / "inventory.yml", ROOT / "pilot.yml"]
+    if args.action == "validate":
+        execute([ROOT / ".venv/bin/python", "-m", "unittest", "discover", "-s", "tests", "-v"], cwd=ROOT)
+        execute([*playbook, "--syntax-check"], cwd=ROOT, env=env)
+        execute([ROOT / ".venv/bin/ansible-playbook", "-i", "localhost,", ROOT / "tests/integration.yml"], cwd=ROOT, env=env)
+        return
+    keys()
+    known = ROOT / ".state/known_hosts"
+    sys.path.insert(0, str(ROOT))
+    from module_utils.pilot import validate
+    validate(config, (ROOT / ".secrets/vps_ed25519.pub").read_text(encoding="utf-8").strip())
+    if args.action == "ssh":
+        execute(["ssh", *ssh_options(ROOT / ".secrets/vps_ed25519", known),
+                 "-p", str(config["vps"]["ssh_port"]), config["vps"]["user"] + "@" + config["public_ip"]])
+        return
+    authorize(host, known)
+    variables = {
+        "pilot_host_key": str(ROOT / ".secrets/host_ed25519"),
+        "pilot_guest_key": str(ROOT / ".secrets/vps_ed25519"),
+        "pilot_known_hosts": str(known),
+        "pilot_preflight_only": args.action == "preflight",
+    }
+    execute([*playbook, "-e", json.dumps(variables)], cwd=ROOT, env=env)
+    if args.action == "up":
+        (ROOT / ".state/connection.json").write_text(json.dumps({"host": config["public_ip"],
+             "port": config["vps"]["ssh_port"], "user": config["vps"]["user"], "vmid": config["vps"]["id"]}, indent=2) + "\n")
+        print("VPS проверен через SSH. Вход: " + shlex.join([str(ROOT / "pilot"), "ssh"]), flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, KeyError) as error:
+        sys.exit("Ошибка: " + str(error))
+    except subprocess.CalledProcessError as error:
+        sys.exit(error.returncode)
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -1,0 +1,13 @@
+[Unit]
+Description=Proxmox pilot NAT and SSH forwarding
+Wants=network-online.target
+After=network-online.target pve-firewall.service proxmox-firewall.service
+Before=pve-guests.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/proxmox-pilot-nat start
+
+[Install]
+WantedBy=multi-user.target

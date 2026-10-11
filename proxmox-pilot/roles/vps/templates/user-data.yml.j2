@@ -1,0 +1,19 @@
+#cloud-config
+hostname: {{ pilot.vps.name }}
+manage_etc_hosts: true
+users:
+  - name: {{ pilot.vps.user }}
+    gecos: VPS administrator
+    groups: [adm, sudo]
+    shell: /bin/bash
+    sudo: 'ALL=(ALL) NOPASSWD:ALL'
+    lock_passwd: true
+    ssh_authorized_keys:
+      - {{ pilot_guest_public_key | to_json }}
+disable_root: true
+ssh_pwauth: false
+package_update: true
+package_upgrade: false
+packages: [qemu-guest-agent]
+runcmd:
+  - [systemctl, enable, --now, qemu-guest-agent]

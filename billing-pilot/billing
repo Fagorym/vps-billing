@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Pilot controller. No passwords on the command line or in Git."""
+import argparse
+import importlib.util
+import json
+import os
+from pathlib import Path
+import secrets
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent
+PILOT = ROOT.parent / 'proxmox-pilot'
+PROJECT = 'safehost-billing-demo'
+CHECK = False
+
+def execute(args, **kwargs):
+    return subprocess.run([str(a) for a in args], check=True, **kwargs)
+
+def bootstrap():
+    python = PILOT / '.venv/bin/python'
+    if not python.exists():
+        candidates = [os.environ.get('PILOT_PYTHON'), sys.executable,
+                      str(Path.home() / '.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3')]
+        for candidate in [p for p in candidates if p and Path(p).exists()]:
+            probe = subprocess.run([candidate, '-c', 'import ssl,venv,xml.parsers.expat; import sys; assert sys.version_info >= (3,12)'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if probe.returncode == 0:
+                execute([candidate, '-m', 'venv', PILOT / '.venv'])
+                break
+        else:
+            raise ValueError('Нужен исправный Python 3.12+; задайте PILOT_PYTHON')
+        execute([python, '-m', 'pip', 'install', '-r', PILOT / 'requirements.txt'])
+    if Path(sys.prefix).resolve() != (PILOT / '.venv').resolve():
+        os.execv(str(python), [str(python), str(ROOT / 'billing'), *sys.argv[1:]])
+
+def directory(path):
+    if path.is_symlink():
+        raise ValueError('Symlink в секретах/состоянии запрещён: ' + str(path))
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+
+def prepare():
+    for name in ('.state', '.secrets', '.secrets/transport'):
+        directory(ROOT / name)
+    credentials, env = ROOT / '.secrets/bootstrap.json', ROOT / '.env'
+    for file in (credentials, env):
+        if file.is_symlink():
+            raise ValueError('Секреты не должны быть symlink')
+    if credentials.exists() != env.exists():
+        raise ValueError('Потерян bootstrap.json или .env; восстановите исходные секреты, пароль БД не меняем')
+    if not credentials.exists():
+        value = {'database_password': secrets.token_hex(32), 'admin_password': 'Aa1!' + secrets.token_urlsafe(30),
+                 'admin_email': 'admin@example.test'}
+        credentials.write_text(json.dumps(value, indent=2) + '\n')
+        env.write_text('MARIADB_PASSWORD=' + value['database_password'] + '\n')
+    credentials.chmod(0o600)
+    env.chmod(0o600)
+    for key in (ROOT / '.secrets/admin_ed25519', ROOT / '.secrets/transport/id_ed25519'):
+        if key.is_symlink() or key.with_suffix('.pub').is_symlink():
+            raise ValueError('SSH key не должен быть symlink')
+        if not key.exists():
+            execute(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'safehost-billing-pilot', '-f', key])
+        key.chmod(0o600)
+    print('Секреты: ' + str(credentials), flush=True)
+
+def compose(*args, demo=False, **kwargs):
+    probe = subprocess.run(['docker', 'compose', 'version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if probe.returncode == 0:
+        prefix = ['docker', 'compose']
+    else:
+        # Project-local client container; no global Docker/Homebrew config changes.
+        prefix = ['docker', 'run', '--rm', '-i', '-v', '/var/run/docker.sock:/var/run/docker.sock',
+                  '-v', str(ROOT) + ':' + str(ROOT), '-w', ROOT,
+                  'docker:28-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d', 'compose']
+    cmd = [*prefix, '--progress', 'quiet', '-p', PROJECT if demo else 'safehost-billing', '-f', ROOT / 'compose.yml']
+    if demo:
+        cmd += ['-f', ROOT / 'tests/compose.demo.yml']
+        if CHECK:
+            cmd += ['-f', ROOT / 'tests/compose.check.yml']
+    return execute([*cmd, *args], cwd=ROOT, **kwargs)
+
+def install_local():
+    compose('up', '-d', '--build', '--wait', demo=True)
+    compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/opt/pilot/install.php', demo=True,
+            input=(ROOT / '.secrets/bootstrap.json').read_text(), text=True)
+    compose('exec', '-T', 'billing', 'sh', '-ec',
+            'mkdir -p /var/www/html/library/Plugin/SafehostProxmox /var/www/html/modules/Servicecustom/templates/client; '
+            'cp /opt/pilot/SafehostProxmox.php /var/www/html/library/Plugin/SafehostProxmox/; '
+            'cp /opt/pilot/mod_servicecustom_manage.html.twig /var/www/html/modules/Servicecustom/templates/client/; '
+            'chown -R www-data:www-data /var/www/html/library/Plugin/SafehostProxmox /var/www/html/modules/Servicecustom/templates/client /var/www/html/data', demo=True)
+    compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/opt/pilot/seed.php', demo=True)
+
+def ansible_env():
+    env = os.environ.copy()
+    env.update(ANSIBLE_CONFIG=str(PILOT / 'ansible.cfg'), ANSIBLE_LIBRARY=str(ROOT / 'ansible/library') + ':' + str(PILOT / 'library'),
+               ANSIBLE_MODULE_UTILS=str(PILOT / 'module_utils'), ANSIBLE_LOCAL_TEMP=str(ROOT / '.state/tmp'),
+               ANSIBLE_HOME=str(ROOT / '.state/ansible'), ANSIBLE_SSH_CONTROL_PATH_DIR=str(ROOT / '.state/cp'))
+    return env
+
+def remote_up():
+    import yaml
+    from module_utils.pilot import markers
+    base = yaml.safe_load((PILOT / 'group_vars/proxmox.yml').read_text())['pilot']
+    config = json.loads((ROOT / 'config.json').read_text())
+    if any(config[k] != base[k] for k in ('public_ip', 'node', 'template_id', 'storage', 'bridge', 'gateway', 'subnet', 'dns')):
+        raise ValueError('Конфигурации billing-pilot и proxmox-pilot расходятся')
+    fixed = {'vm_first': 1100, 'ip_first': '10.10.10.20', 'ssh_port_first': 22220}
+    if (any(config[k] != value for k, value in fixed.items()) or type(config['slots']) is not int
+            or config['slots'] not in (5, 10) or base['public_ip'] != '80.249.131.4'):
+        raise ValueError('Этот пилот закреплён за VM 101 и пулом от 1100 на 5 или 10 мест')
+    first = base['vps']
+    import ipaddress
+    pool_ips = {str(ipaddress.ip_address(config['ip_first']) + i) for i in range(config['slots'])}
+    if (first['id'] == 101 or 1100 <= first['id'] < 1100 + config['slots'] or first['ip'] in
+            {'10.10.10.11', *pool_ips} or first['ssh_port'] == 2223
+            or 22220 <= first['ssh_port'] < 22220 + config['slots']):
+        raise ValueError('Первый VPS пересекается с VM биллинга или пулом заказов; выберите свободный VMID/IP/порт')
+    # The existing tested pilot verifies the public network, creates template 9000 and the configured first VPS.
+    execute([PILOT / 'pilot', 'up'], cwd=PILOT)
+    config['template_marker'] = markers(base, (PILOT / '.secrets/vps_ed25519.pub').read_text().strip())['template']
+    vm = {**base, 'vps': {'id': 101, 'name': 'billing-test', 'cores': 2, 'memory_mb': 4096,
+                         'disk_gb': 40, 'ip': '10.10.10.11', 'ssh_port': 2223, 'user': 'vpsadmin'}}
+    nat = [{'ip': vm['vps']['ip'], 'port': 2223}]
+    import ipaddress
+    nat += [{'ip': str(ipaddress.ip_address(config['ip_first']) + i), 'port': config['ssh_port_first'] + i}
+            for i in range(config['slots'])]
+    variables = {'billing_root': str(ROOT), 'pilot_root': str(PILOT), 'billing_vm_config': vm, 'engine': config,
+                 'billing_nat': nat, 'pilot_host_key': str(PILOT / '.secrets/host_ed25519'),
+                 'pilot_guest_key': str(ROOT / '.secrets/admin_ed25519'),
+                 'pilot_known_hosts': str(PILOT / '.state/known_hosts')}
+    execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml', ROOT / 'ansible/deploy.yml',
+             '-e', json.dumps(variables)], cwd=ROOT, env=ansible_env())
+    print('Биллинг установлен в VM 101. Панель: ./billing open → http://127.0.0.1:8088/', flush=True)
+
+def public_up():
+    config = json.loads((ROOT / 'config.json').read_text())
+    if config['public_ip'] != '80.249.131.4':
+        raise ValueError('Публичный доступ этого пилота закреплён за 80.249.131.4')
+    variables = {'billing_root': str(ROOT), 'pilot_host_key': str(PILOT / '.secrets/host_ed25519'),
+                 'pilot_guest_key': str(ROOT / '.secrets/admin_ed25519'),
+                 'pilot_known_hosts': str(PILOT / '.state/known_hosts')}
+    execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml', ROOT / 'ansible/public.yml',
+             '-e', json.dumps(variables)], cwd=ROOT, env=ansible_env())
+    print('Публичная панель: https://80.249.131.4/admin . SSH-туннель не нужен.', flush=True)
+
+def remote_update():
+    variables = {'billing_root': str(ROOT), 'pilot_host_key': str(PILOT / '.secrets/host_ed25519'),
+                 'pilot_guest_key': str(ROOT / '.secrets/admin_ed25519'),
+                 'pilot_known_hosts': str(PILOT / '.state/known_hosts')}
+    execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml', ROOT / 'ansible/update.yml',
+             '-e', json.dumps(variables)], cwd=ROOT, env=ansible_env())
+    print('Приложение обновлено: https://80.249.131.4/admin . Действующие VPS сохранены.', flush=True)
+
+def expand_pool():
+    import ipaddress
+    config = json.loads((ROOT / 'config.json').read_text())
+    if type(config['slots']) is not int or config['slots'] != 10:
+        raise ValueError('Для этой миграции задайте slots: 10 в config.json')
+    nat = [{'ip': '10.10.10.11', 'port': 2223}]
+    nat += [{'ip': str(ipaddress.ip_address(config['ip_first']) + i), 'port': config['ssh_port_first'] + i}
+            for i in range(config['slots'])]
+    variables = {'billing_root': str(ROOT), 'engine': config, 'billing_nat': nat,
+                 'pilot_host_key': str(PILOT / '.secrets/host_ed25519'),
+                 'pilot_known_hosts': str(PILOT / '.state/known_hosts')}
+    execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml', ROOT / 'ansible/expand.yml',
+             '-e', json.dumps(variables)], cwd=ROOT, env=ansible_env())
+    print('Пул VPS: 10 мест, VMID 1100–1109, SSH 22220–22229. Действующие VM сохранены.', flush=True)
+
+def main():
+    global PROJECT, CHECK
+    parser = argparse.ArgumentParser()
+    parser.add_argument('action', choices=('prepare', 'demo', 'test', 'up', 'publish', 'update', 'expand', 'open'))
+    args = parser.parse_args()
+    bootstrap()
+    sys.path.insert(0, str(PILOT))
+    prepare()
+    if args.action == 'prepare':
+        return
+    if args.action == 'up':
+        remote_up()
+    elif args.action == 'publish':
+        public_up()
+    elif args.action == 'update':
+        remote_update()
+    elif args.action == 'expand':
+        expand_pool()
+    elif args.action == 'open':
+        print('Панель: http://127.0.0.1:8088/ . Туннель работает, пока эта команда запущена.', flush=True)
+        execute(['ssh', '-N', '-i', ROOT / '.secrets/admin_ed25519', '-p', '2223',
+                 '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
+                 '-o', 'UserKnownHostsFile=' + str(PILOT / '.state/known_hosts'), '-o', 'ExitOnForwardFailure=yes',
+                 '-L', '127.0.0.1:8088:127.0.0.1:8088', 'vpsadmin@80.249.131.4'])
+    else:
+        if args.action == 'test':
+            CHECK = True
+            PROJECT = 'safehost-billing-check-' + secrets.token_hex(4)
+            (ROOT / '.state/last-test-project').write_text(PROJECT + '\n')
+            if importlib.util.find_spec('cryptography') is None:
+                execute([sys.executable, '-m', 'pip', 'install', '-r', ROOT / 'requirements.txt'])
+            execute([sys.executable, '-m', 'unittest', 'discover', '-s', ROOT / 'tests', '-v'], cwd=ROOT)
+            execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml',
+                     ROOT / 'ansible/deploy.yml', '--syntax-check'], cwd=ROOT, env=ansible_env())
+            execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml',
+                     ROOT / 'ansible/update.yml', '--syntax-check'], cwd=ROOT, env=ansible_env())
+            execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml',
+                     ROOT / 'ansible/expand.yml', '--syntax-check'], cwd=ROOT, env=ansible_env())
+        install_local()
+        if args.action == 'test':
+            compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/e2e.php', demo=True)
+            compose('down', '-v', demo=True)
+            print('Тестовый проект и его временные volumes удалены. Данные demo и сервера сохранены.', flush=True)
+            return
+        print('Локальный тестовый биллинг: http://127.0.0.1:8088/ . Proxmox в demo заменён симулятором.', flush=True)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError, KeyError) as exc:
+        sys.exit('Ошибка: ' + str(exc))
+    except subprocess.CalledProcessError as exc:
+        sys.exit(exc.returncode)
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -1,0 +1,141 @@
+---
+- name: Подготовить Proxmox и первый VPS
+  hosts: proxmox
+  gather_facts: false
+  serial: 1
+  vars:
+    ansible_ssh_private_key_file: "{{ pilot_host_key }}"
+    ansible_ssh_common_args: "-o UserKnownHostsFile={{ pilot_known_hosts | quote }} -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+  pre_tasks:
+    - name: Проверить параметры запуска
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - groups['proxmox'] | length == 1
+          - pilot_host_key is defined
+          - pilot_guest_key is defined
+          - pilot_known_hosts is defined
+        fail_msg: Используйте ./pilot up или ./pilot preflight. Ansible --check не поддерживается.
+
+    - name: Прочитать открытый ключ VPS
+      ansible.builtin.set_fact:
+        pilot_guest_public_key: "{{ lookup('ansible.builtin.file', pilot_guest_key + '.pub') | trim }}"
+
+    - name: Проверить сервер до изменения сети и VM
+      pilot_guard:
+        config: "{{ pilot }}"
+        public_key: "{{ pilot_guest_public_key }}"
+        legacy_expected: "{{ lookup('ansible.builtin.file', 'files/legacy-vps-pilot') }}"
+      register: pilot_preflight
+      tags: [preflight]
+
+    - name: Вывести результат предварительной проверки
+      ansible.builtin.debug:
+        var: pilot_preflight.summary
+
+    - name: Завершить режим предварительной проверки
+      ansible.builtin.meta: end_play
+      when: pilot_preflight_only | default(false) | bool
+
+  roles:
+    - host
+    - vps
+
+  post_tasks:
+    - name: Получить SSH host key VPS через доверенный Proxmox и guest agent
+      ansible.builtin.command:
+        argv:
+          - qm
+          - guest
+          - exec
+          - "{{ pilot.vps.id | string }}"
+          - --timeout
+          - '30'
+          - --
+          - cat
+          - /etc/ssh/ssh_host_ed25519_key.pub
+      register: pilot_guest_host_key
+      changed_when: false
+      until: >-
+        pilot_guest_host_key.rc == 0 and
+        (pilot_guest_host_key.stdout | from_json).get('exitcode', -1) == 0
+      retries: 60
+      delay: 10
+
+    - name: Проверить формат ключа гостя
+      ansible.builtin.assert:
+        that:
+          - (pilot_guest_host_key.stdout | from_json)['out-data'] is match('^ssh-ed25519 [A-Za-z0-9+/=]+( |\n|$)')
+
+    - name: Закрепить ключ гостя, полученный через Proxmox
+      ansible.builtin.known_hosts:
+        path: "{{ pilot_known_hosts }}"
+        name: "[{{ pilot.public_ip }}]:{{ pilot.vps.ssh_port }}"
+        key: "[{{ pilot.public_ip }}]:{{ pilot.vps.ssh_port }} {{ ((pilot_guest_host_key.stdout | from_json)['out-data']).split()[:2] | join(' ') }}"
+      delegate_to: localhost
+
+    - name: Добавить VPS для реальной проверки SSH
+      ansible.builtin.add_host:
+        name: pilot_vps
+        groups: pilot_guests
+        ansible_host: "{{ pilot.public_ip }}"
+        ansible_port: "{{ pilot.vps.ssh_port }}"
+        ansible_user: "{{ pilot.vps.user }}"
+        ansible_ssh_private_key_file: "{{ pilot_guest_key }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: "-o UserKnownHostsFile={{ pilot_known_hosts | quote }} -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+
+- name: Проверить VPS через публичный SSH-порт
+  hosts: pilot_guests
+  gather_facts: false
+  tasks:
+    - name: Дождаться входа по SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        sleep: 5
+
+    - name: Дождаться успешного завершения cloud-init
+      ansible.builtin.command: cloud-init status --wait
+      become: true
+      async: 600
+      poll: 10
+      changed_when: false
+
+    - name: Проверить SSH и QEMU guest agent
+      ansible.builtin.command: systemctl is-active ssh qemu-guest-agent
+      changed_when: false
+
+    - name: Проверить имя пользователя
+      ansible.builtin.command: id -un
+      register: pilot_logged_user
+      changed_when: false
+
+    - name: Подтвердить вход под заданным пользователем
+      ansible.builtin.assert:
+        that:
+          - pilot_logged_user.stdout == hostvars[groups['proxmox'][0]].pilot.vps.user
+
+    - name: Показать параметры диска
+      ansible.builtin.command: df -h /
+      register: pilot_disk
+      changed_when: false
+
+    - name: Прочитать реальные ресурсы гостя
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - "import json,os,re,shutil; print(json.dumps({'cpu':os.cpu_count(),'memory_kib':int(re.search(r'MemTotal:\\s+(\\d+)',open('/proc/meminfo').read())[1]),'root_bytes':shutil.disk_usage('/').total}))"
+      register: pilot_guest_resources
+      changed_when: false
+
+    - name: Подтвердить CPU, RAM и расширение корневой файловой системы
+      ansible.builtin.assert:
+        that:
+          - (pilot_guest_resources.stdout | from_json).cpu == hostvars[groups['proxmox'][0]].pilot.vps.cores
+          - (pilot_guest_resources.stdout | from_json).memory_kib >= hostvars[groups['proxmox'][0]].pilot.vps.memory_mb * 1024 * 0.85
+          - (pilot_guest_resources.stdout | from_json).root_bytes >= hostvars[groups['proxmox'][0]].pilot.vps.disk_gb * 1073741824 * 0.80
+
+    - name: Показать результат
+      ansible.builtin.debug:
+        msg: "SSH работает. {{ pilot_disk.stdout_lines }}"

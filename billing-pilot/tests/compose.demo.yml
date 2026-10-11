@@ -1,0 +1,21 @@
+services:
+  billing:
+    volumes:
+      - ./tests:/tests:ro
+      - ./tests/ssh-demo.php:/usr/bin/ssh:ro
+    depends_on:
+      mock:
+        condition: service_started
+  mock:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile.mock
+    command: [/usr/bin/python3, /tests/mock-server.py]
+    volumes:
+      - ./tests:/tests:ro
+      - ./backend:/backend:ro
+      - ./config.json:/config.json:ro
+      - mock:/state
+    networks: [billing]
+volumes:
+  mock:

@@ -1,0 +1,65 @@
+---
+- name: Execute real Ansible module against persistent fake qm and pvesh
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../group_vars/proxmox.yml
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    test_root: "{{ playbook_dir }}/.."
+    test_key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICVxZgPnLAIpVBPrZph2PefMEQyw53INofmNiGHKTrYX fixture
+  environment:
+    PATH: "{{ test_root }}/.state/mock/bin:{{ test_root }}/.venv/bin:{{ lookup('ansible.builtin.env', 'PATH') }}"
+    PILOT_FAKE_STATE: "{{ test_root }}/.state/mock/pve.json"
+  tasks:
+    - name: Prepare fixture directory
+      ansible.builtin.file:
+        path: "{{ test_root }}/.state/mock/bin"
+        state: directory
+        mode: '0700'
+
+    - name: Link fake CLI entry points
+      ansible.builtin.file:
+        src: "{{ test_root }}/tests/fake_cli.py"
+        dest: "{{ test_root }}/.state/mock/bin/{{ item }}"
+        state: link
+      loop: [qm, pvesh]
+
+    - name: Reset fixture for independent test
+      ansible.builtin.file:
+        path: "{{ test_root }}/.state/mock/pve.json"
+        state: absent
+
+    - name: Provision through the real module
+      pilot_vm:
+        config: "{{ pilot }}"
+        public_key: "{{ test_key }}"
+      register: first
+
+    - name: Reapply through the real module
+      pilot_vm:
+        config: "{{ pilot }}"
+        public_key: "{{ test_key }}"
+      register: second
+
+    - name: Assert idempotence at the Ansible boundary
+      ansible.builtin.assert:
+        that:
+          - first.changed
+          - not second.changed
+          - first.vmid == pilot.vps.id
+
+    - name: Refuse changing the identity of a managed VPS
+      pilot_vm:
+        config: "{{ pilot | combine({'vps': pilot.vps | combine({'memory_mb': 4096})}) }}"
+        public_key: "{{ test_key }}"
+      register: conflict
+      ignore_errors: true
+
+    - name: Assert refusal without mutations
+      ansible.builtin.assert:
+        that:
+          - conflict is failed
+          - not conflict.changed
+          - "'изменённые параметры' in conflict.msg"

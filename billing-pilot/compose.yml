@@ -1,0 +1,36 @@
+services:
+  billing:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8088:80"
+    volumes:
+      - billing:/var/www/html
+      - ./.secrets/transport:/run/proxmox:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [billing]
+  db:
+    image: mariadb:11.4.8
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: fossbilling
+      MARIADB_USER: fossbilling
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:?Run ./billing prepare}
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+    volumes:
+      - database:/var/lib/mysql
+    healthcheck:
+      test: [CMD, healthcheck.sh, --connect, --innodb_initialized]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    networks: [billing]
+networks:
+  billing:
+volumes:
+  billing:
+  database:

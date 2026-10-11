@@ -1,0 +1,27 @@
+# Конфигурация текущего Selectel. Публичную сеть playbook не переписывает.
+pilot:
+  node: pve1
+  public_ip: 80.249.131.4
+  public_cidr: 80.249.131.4/24
+  public_gateway: 80.249.131.1
+  uplink: vmbr0
+  physical_nic: nic0
+  physical_mac: 30:9c:23:0a:eb:bf
+  bridge: vmbr1
+  subnet: 10.10.10.0/24
+  gateway: 10.10.10.1
+  dns: 1.1.1.1
+  storage: local-lvm
+  template_id: 9000
+  image_url: https://cloud-images.ubuntu.com/releases/noble/release-20260926/ubuntu-24.04-server-cloudimg-amd64.img
+  image_sha256: 6a81c37564db9b1ee84e141922625e1d7c5b389b99bb3c572e0243607d5bb4d2
+  image_path: /var/lib/proxmox-pilot/ubuntu-noble-20260926.qcow2
+  vps:
+    id: 102
+    name: vps-test
+    cores: 1
+    memory_mb: 2048
+    disk_gb: 20
+    ip: 10.10.10.10
+    ssh_port: 2222
+    user: vpsadmin

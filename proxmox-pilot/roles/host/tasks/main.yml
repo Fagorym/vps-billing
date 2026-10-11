@@ -1,0 +1,121 @@
+---
+- name: Настроить подписанные бесплатные репозитории
+  pilot_repositories:
+
+- name: Установить инструменты хоста
+  ansible.builtin.apt:
+    name: [iptables, openssh-client, ca-certificates]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Создать каталоги состояния и резервных копий
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  loop:
+    - /var/lib/proxmox-pilot
+    - /var/lib/proxmox-pilot/backups
+
+- name: Сохранить прежний ручной файл сети
+  ansible.builtin.copy:
+    src: /etc/network/interfaces.d/vps-pilot
+    dest: /var/lib/proxmox-pilot/backups/vps-pilot.manual
+    remote_src: true
+    force: false
+    mode: '0600'
+  when: pilot_preflight.legacy_present
+
+- name: Убрать проверенный прежний файл из source wildcard
+  ansible.builtin.file:
+    path: /etc/network/interfaces.d/vps-pilot
+    state: absent
+  when: pilot_preflight.legacy_present
+
+- name: Добавить private bridge в основной interfaces для GUI Proxmox
+  ansible.builtin.blockinfile:
+    path: /etc/network/interfaces
+    marker: '# {mark} PROXMOX-PILOT PRIVATE BRIDGE'
+    backup: true
+    block: |
+      auto {{ pilot.bridge }}
+      iface {{ pilot.bridge }} inet static
+          address {{ pilot.gateway }}/{{ pilot.subnet.split('/')[1] }}
+          bridge-ports none
+          bridge-stp off
+          bridge-fd 0
+  register: pilot_network
+
+- name: Поднять только private bridge
+  ansible.builtin.command:
+    argv: [ifup, --force, "{{ pilot.bridge }}"]
+  when: pilot_network.changed or pilot_preflight.legacy_present or not pilot_preflight.bridge_ready
+
+- name: Проверить видимость bridge в Proxmox
+  ansible.builtin.command:
+    argv: [pvesh, get, "/nodes/{{ pilot.node }}/network", --output-format, json]
+  register: pilot_network_api
+  changed_when: false
+
+- name: Подтвердить наличие private bridge в API
+  ansible.builtin.assert:
+    that:
+      - pilot.bridge in (pilot_network_api.stdout | from_json | map(attribute='iface') | list)
+
+- name: Сохранить IPv4 forwarding после перезагрузки
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-proxmox-pilot.conf
+    content: "net.ipv4.ip_forward = 1\n"
+    mode: '0644'
+
+- name: Прочитать IPv4 forwarding
+  ansible.builtin.command: sysctl -n net.ipv4.ip_forward
+  register: pilot_forwarding
+  changed_when: false
+
+- name: Включить IPv4 forwarding
+  ansible.builtin.command: sysctl -w net.ipv4.ip_forward=1
+  when: pilot_forwarding.stdout != '1'
+
+- name: Сохранить NAT-правила
+  ansible.builtin.template:
+    src: nat.sh.j2
+    dest: /usr/local/sbin/proxmox-pilot-nat
+    owner: root
+    group: root
+    mode: '0750'
+    validate: /bin/sh -n %s
+  register: pilot_nat_script
+
+- name: Сохранить сервис NAT
+  ansible.builtin.template:
+    src: nat.service.j2
+    dest: /etc/systemd/system/proxmox-pilot-nat.service
+    mode: '0644'
+  register: pilot_nat_unit
+
+- name: Включить сервис NAT сейчас и при загрузке
+  ansible.builtin.systemd_service:
+    name: proxmox-pilot-nat
+    daemon_reload: "{{ pilot_nat_unit.changed }}"
+    enabled: true
+    state: "{{ 'restarted' if pilot_nat_script.changed or pilot_nat_unit.changed else 'started' }}"
+
+- name: Проверить NAT-правила
+  ansible.builtin.command: /usr/local/sbin/proxmox-pilot-nat check
+  register: pilot_nat_check
+  changed_when: false
+  failed_when: false
+
+- name: Восстановить отсутствующие правила своего сервиса
+  ansible.builtin.systemd_service:
+    name: proxmox-pilot-nat
+    state: restarted
+  when: pilot_nat_check.rc != 0
+
+- name: Подтвердить NAT-правила
+  ansible.builtin.command: /usr/local/sbin/proxmox-pilot-nat check
+  changed_when: false

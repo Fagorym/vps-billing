@@ -1,0 +1,11 @@
+.cache
+.secrets
+.state
+.git
+__pycache__
+.env
+tests
+ansible
+backend
+README.md
+billing

@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+# managed-by: proxmox-pilot:v1
+
+# Own chains only. Never flush the host's filter/nat tables.
+ipt() { /usr/sbin/iptables -w 10 "$@"; }
+rule() {
+    table=$1; chain=$2; shift 2
+    if [ "${1-}" = CHECK ]; then shift; ipt -t "$table" -C "$chain" "$@"; else ipt -t "$table" -A "$chain" "$@"; fi
+}
+mode=${1-start}
+case "$mode" in
+    start)
+        for item in nat:PILOT_DNAT nat:PILOT_SNAT filter:PILOT_FWD; do
+            table=${item%:*}; chain=${item#*:}
+            ipt -t "$table" -S "$chain" >/dev/null 2>&1 || ipt -t "$table" -N "$chain"
+            ipt -t "$table" -F "$chain"
+        done
+        op=''
+        ;;
+    check) op=CHECK ;;
+    *) exit 2 ;;
+esac
+
+rule nat PILOT_DNAT $op -i {{ pilot.uplink }} -d {{ pilot.public_ip }}/32 -p tcp --dport {{ pilot.vps.ssh_port }} -j DNAT --to-destination {{ pilot.vps.ip }}:22
+rule nat PILOT_SNAT $op -s {{ pilot.vps.ip }}/32 -o {{ pilot.uplink }} -j MASQUERADE
+rule filter PILOT_FWD $op -i {{ pilot.bridge }} -o {{ pilot.uplink }} -s {{ pilot.vps.ip }}/32 -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+rule filter PILOT_FWD $op -i {{ pilot.uplink }} -o {{ pilot.bridge }} -d {{ pilot.vps.ip }}/32 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+rule filter PILOT_FWD $op -i {{ pilot.uplink }} -o {{ pilot.bridge }} -d {{ pilot.vps.ip }}/32 -p tcp --dport 22 -m conntrack --ctstate NEW --ctorigdst {{ pilot.public_ip }} --ctorigdstport {{ pilot.vps.ssh_port }} -j ACCEPT
+
+for item in nat:PREROUTING:PILOT_DNAT nat:POSTROUTING:PILOT_SNAT filter:FORWARD:PILOT_FWD; do
+    table=${item%%:*}; tail=${item#*:}; parent=${tail%:*}; chain=${tail#*:}
+    if [ "$mode" = check ]; then
+        ipt -t "$table" -C "$parent" -j "$chain"
+    else
+        ipt -t "$table" -C "$parent" -j "$chain" >/dev/null 2>&1 || ipt -t "$table" -I "$parent" 1 -j "$chain"
+    fi
+done

@@ -1,0 +1,53 @@
+{% if order.status == 'active' %}
+    {% set vps = client.servicecustom_call({'order_id': order.id, 'method': 'connection'}) %}
+    <div class="card-body">
+        <h3>Доступ к VPS</h3>
+        <p>Ubuntu 24.04 · {{ vps.status }} · VM {{ vps.vmid }}</p>
+        <p>Адрес: {{ vps.public_ip }} · порт: {{ vps.ssh_port }} · пользователь: {{ vps.user }}</p>
+        {% if vps.auth_mode == 'password' %}
+            <pre>{{ vps.ssh }}</pre>
+            <p>Начальный пароль: при первом SSH-входе сервер попросит заменить его своим.
+                После смены показанный здесь начальный пароль больше не действует.</p>
+            <button type="button" class="btn btn-primary" id="safehost-password-button">Показать начальный пароль</button>
+            <input type="password" readonly autocomplete="off" aria-label="Начальный пароль VPS"
+                   id="safehost-password-value" hidden>
+            <p id="safehost-password-error" role="alert"></p>
+            <script>
+                (() => {
+                    const button = document.getElementById('safehost-password-button');
+                    const value = document.getElementById('safehost-password-value');
+                    const error = document.getElementById('safehost-password-error');
+                    button.addEventListener('click', () => {
+                        if (!value.hidden) {
+                            value.value = '';
+                            value.hidden = true;
+                            value.type = 'password';
+                            button.textContent = 'Показать начальный пароль';
+                            return;
+                        }
+                        button.disabled = true;
+                        error.textContent = '';
+                        FOSSBilling.api.client.post('servicecustom/call', {
+                            order_id: {{ order.id }}, method: 'initial_password'
+                        }, result => {
+                            value.value = result.password;
+                            value.type = 'text';
+                            value.hidden = false;
+                            button.disabled = false;
+                            button.textContent = 'Скрыть пароль';
+                        }, result => {
+                            button.disabled = false;
+                            error.textContent = result.message || 'Не удалось получить пароль';
+                        });
+                    });
+                })();
+            </script>
+        {% else %}
+            <p>Вход с приватным ключом, который соответствует публичному ключу в заказе:</p>
+            <pre>{{ vps.ssh }} -i /путь/к/приватному_ключу</pre>
+        {% endif %}
+        <p>SSH host key при первом входе проверяется через консоль Proxmox. Внутренний IP: {{ vps.private_ip }}.</p>
+    </div>
+{% else %}
+    <div class="card-body">Доступ появится после подтверждения тестовой оплаты. Статус: {{ order.status }}</div>
+{% endif %}

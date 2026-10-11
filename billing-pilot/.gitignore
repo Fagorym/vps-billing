@@ -1,0 +1,6 @@
+.cache/
+.state/
+.secrets/
+__pycache__/
+*.pyc
+.env

@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+# managed-by: safehost-billing:v1
+ipt() { /usr/sbin/iptables -w 10 "$@"; }
+for item in nat:BILL_DNAT nat:BILL_SNAT filter:BILL_FWD; do
+    table=${item%:*}; chain=${item#*:}
+    ipt -t "$table" -S "$chain" >/dev/null 2>&1 || ipt -t "$table" -N "$chain"
+    ipt -t "$table" -F "$chain"
+done
+{% for v in billing_nat %}
+ipt -t nat -A BILL_DNAT -i vmbr0 -d {{ engine.public_ip }}/32 -p tcp --dport {{ v.port }} -j DNAT --to-destination {{ v.ip }}:22
+ipt -t nat -A BILL_SNAT -s {{ v.ip }}/32 -o vmbr0 -j MASQUERADE
+ipt -t filter -A BILL_FWD -i vmbr1 -o vmbr0 -s {{ v.ip }}/32 -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+ipt -t filter -A BILL_FWD -i vmbr0 -o vmbr1 -d {{ v.ip }}/32 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+ipt -t filter -A BILL_FWD -i vmbr0 -o vmbr1 -d {{ v.ip }}/32 -p tcp --dport 22 -m conntrack --ctstate NEW --ctorigdst {{ engine.public_ip }} --ctorigdstport {{ v.port }} -j ACCEPT
+{% endfor %}
+for item in nat:PREROUTING:BILL_DNAT nat:POSTROUTING:BILL_SNAT filter:FORWARD:BILL_FWD; do
+    table=${item%%:*}; tail=${item#*:}; parent=${tail%:*}; chain=${tail#*:}
+    ipt -t "$table" -C "$parent" -j "$chain" >/dev/null 2>&1 || ipt -t "$table" -I "$parent" 1 -j "$chain"
+done

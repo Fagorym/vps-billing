@@ -1,0 +1,57 @@
+---
+- name: Прочитать конфигурацию local storage
+  ansible.builtin.command:
+    argv: [pvesh, get, /storage/local, --output-format, json]
+  register: pilot_local_storage
+  changed_when: false
+
+- name: Разрешить snippets, сохранив остальные типы content
+  ansible.builtin.command:
+    argv:
+      - pvesh
+      - set
+      - /storage/local
+      - --content
+      - "{{ (((pilot_local_storage.stdout | from_json).content.split(',')) + ['snippets']) | unique | join(',') }}"
+  when: "'snippets' not in (pilot_local_storage.stdout | from_json).content.split(',')"
+
+- name: Создать каталог cloud-init snippets
+  ansible.builtin.file:
+    path: /var/lib/vz/snippets
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Сохранить cloud-init пользователя VPS
+  ansible.builtin.template:
+    src: user-data.yml.j2
+    dest: "/var/lib/vz/snippets/proxmox-pilot-{{ pilot.vps.id }}-user.yaml"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Скачать закреплённый Ubuntu 24.04 cloud image и проверить SHA256
+  ansible.builtin.get_url:
+    url: "{{ pilot.image_url }}"
+    dest: "{{ pilot.image_path }}"
+    checksum: "sha256:{{ pilot.image_sha256 }}"
+    mode: '0600'
+    timeout: 60
+
+- name: Прочитать формат скачанного образа
+  ansible.builtin.command:
+    argv: [qemu-img, info, --output=json, "{{ pilot.image_path }}"]
+  register: pilot_image_info
+  changed_when: false
+
+- name: Проверить QCOW2 и исходный размер
+  ansible.builtin.assert:
+    that:
+      - (pilot_image_info.stdout | from_json).format == 'qcow2'
+      - (pilot_image_info.stdout | from_json)['virtual-size'] <= pilot.vps.disk_gb * 1073741824
+
+- name: Создать или продолжить создание своих template и VPS
+  pilot_vm:
+    config: "{{ pilot }}"
+    public_key: "{{ pilot_guest_public_key }}"
