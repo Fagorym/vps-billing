@@ -223,6 +223,8 @@ class Engine:
         require(row['phase'] == 'ready' and self.pve.status(self.vmid(row)) == 'running',
                 'Пароль доступен только у активного VPS')
         require(json.loads(row['spec'])['ssh_key'] is None, 'Этот VPS использует SSH-ключ')
+        ip = str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])
+        require(self.pve.ready(self.vmid(row), ip), 'SSH ещё не готов; повторите запрос')
         credential = self.db.execute('SELECT encrypted FROM credential WHERE order_id=?', (row['order_id'],)).fetchone()
         require(credential is not None, 'Не найден начальный пароль; нужна проверка администратором')
         try:
@@ -360,13 +362,19 @@ def main():
     config = json.loads(Path('/etc/safehost-billing/config.json').read_text())
     state = Path('/var/lib/safehost-billing')
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    raw = sys.stdin.buffer.read(8193)
+    require(len(raw) <= 8192, 'Запрос слишком большой')
+    request = json.loads(raw)
+    require(isinstance(request, dict), 'Ожидается JSON object')
     with (state / 'operation.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        raw = sys.stdin.buffer.read(8193)
-        require(len(raw) <= 8192, 'Запрос слишком большой')
+        read_only = request.get('action') in ('status', 'readiness', 'password')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB if read_only else fcntl.LOCK_EX)
+        except BlockingIOError as exc:
+            raise Refused('Выполняется изменение VPS; повторите запрос') from exc
         engine = Engine(config, state, '/var/lib/vz/snippets')
         try:
-            result = engine.handle(json.loads(raw))
+            result = engine.handle(request)
         finally:
             engine.db.close()
     print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))

@@ -11,3 +11,9 @@
 Резервная копия: согласованный dump MariaDB, `data/portal`, `/var/lib/safehost-billing/allocations.sqlite`, `/var/lib/safehost-billing/credential.key`, конфигурация пула и секреты. Копировать SQLite через backup API; открытый WAL нельзя копировать отдельно. Слоты отменённых заказов и диски сохраняются.
 
 Обновление: исходный `./billing prepare`, затем `./billing update`. `ansible/update.yml` обновляет engine, приложение и endpoint; nginx-конфигурация `public/nginx.conf` ограничивает endpoint IP сервера кабинета. Секрет `PORTAL_BRIDGE_TOKEN` передаётся backend как `SAFEHOST_BILLING_TOKEN`; URL — `https://80.249.131.4/portal.php`. Проверка `./billing test` использует отдельный Docker-проект, настоящий FOSSBilling и симулятор Proxmox.
+
+## Смена пароля и задержки
+
+При первом SSH-входе `Password` и `Current password` требуют один и тот же временный пароль. Новый вводят на `New password`, повторяют на `Retype new password`. В терминале ввод не отображается. Ошибка PAM на Current password не меняет пароль. При необходимости используйте `ssh -tt` для интерактивной смены.
+
+Запрос password проверяет владельца, активную VM, cloud-init и SSH в одном обращении к адаптеру. Фоновые status/readiness и выдача пароля используют shared locks; изменение VM остаётся exclusive. Если идёт создание или изменение VM, чтение отказывает сразу для повторного запроса, вместо длительного ожидания за provisioning. Выдача не меняет пароль и не создаёт VM.

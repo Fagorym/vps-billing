@@ -34,10 +34,11 @@ final class PortalBridge
         if (!in_array($r['action'] ?? '', ['create', 'status', 'password', 'start', 'stop'], true)) {
             throw new InvalidArgumentException('Invalid action');
         }
-        // A separate process/request can recover a response lost at any point. Lock all writers,
-        // including activation, so an activation retry never races the same order.
+        // Writers serialize reservation and activation. Reads share the lock and refuse a busy
+        // writer immediately instead of queueing a credential request behind provisioning.
         $lock = fopen($this->directory . '/operation.lock', 'c');
-        if (!$lock || !flock($lock, LOCK_EX)) { throw new RuntimeException('Bridge unavailable'); }
+        $mode = in_array($r['action'], ['status', 'password'], true) ? LOCK_SH | LOCK_NB : LOCK_EX;
+        if (!$lock || !flock($lock, $mode)) { throw new RuntimeException('Bridge unavailable'); }
         try {
             $row = $this->row('SELECT * FROM orders WHERE reference=?', [$r['reference']]);
             if ($r['action'] === 'create') {
@@ -72,8 +73,7 @@ final class PortalBridge
             }
             if ($r['action'] === 'password') {
                 if ($order['status'] !== 'active') { throw new DomainException('VPS inactive'); }
-                $ready = $this->foss->call($clientId, $id, 'readiness');
-                if (!($ready['ready'] ?? false)) { throw new DomainException('SSH not ready'); }
+                // The adapter checks ownership, VM state and SSH readiness in this same call.
                 return $this->foss->call($clientId, $id, 'initial_password');
             }
             if ($r['action'] === 'stop' && $order['status'] === 'active') { $this->foss->suspend($id); }

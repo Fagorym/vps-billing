@@ -6,6 +6,10 @@ from pathlib import Path
 import struct
 import tempfile
 import unittest
+import fcntl
+import io
+import threading
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +71,56 @@ class FakePVE:
                 raise OSError('lost start response')
 
 
+class CLILockingContracts(unittest.TestCase):
+    def invoke_while_locked(self, held_mode, action):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = root / 'config.json'
+            config.write_text('{}')
+            state = root / 'state'
+            state.mkdir()
+            outcome = []
+            fake = SimpleNamespace(db=SimpleNamespace(close=lambda: None), handle=lambda request: {'status': 'running'})
+            def path(value):
+                return config if value == '/etc/safehost-billing/config.json' else state if value == '/var/lib/safehost-billing' else Path(value)
+            def invoke():
+                try:
+                    engine.main()
+                    outcome.append(None)
+                except Exception as error:
+                    outcome.append(type(error))
+            with (state / 'operation.lock').open('a') as held:
+                fcntl.flock(held, held_mode)
+                with patch.object(engine, 'Path', side_effect=path), patch.object(engine, 'Engine', return_value=fake), \
+                     patch.object(engine.sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(json.dumps({'action': action}).encode()))), \
+                     patch.object(engine.sys, 'stdout', io.StringIO()):
+                    task = threading.Thread(target=invoke, daemon=True)
+                    task.start()
+                    try:
+                        task.join(timeout=0.5)
+                        completed = not task.is_alive()
+                    finally:
+                        fcntl.flock(held, fcntl.LOCK_UN)
+                        task.join(timeout=2)
+                self.assertFalse(task.is_alive())
+            return completed, outcome
+
+    def test_status_does_not_queue_behind_another_read(self):
+        completed, outcome = self.invoke_while_locked(fcntl.LOCK_SH, 'status')
+        self.assertTrue(completed, 'A read was queued behind a read')
+        self.assertEqual(outcome, [None])
+
+    def test_password_fails_fast_while_a_mutation_is_running(self):
+        completed, outcome = self.invoke_while_locked(fcntl.LOCK_EX, 'password')
+        self.assertTrue(completed, 'Password lookup waited for a mutation')
+        self.assertEqual(outcome, [engine.Refused])
+
+    def test_mutation_still_waits_for_existing_readers(self):
+        completed, outcome = self.invoke_while_locked(fcntl.LOCK_SH, 'suspend')
+        self.assertFalse(completed)
+        self.assertEqual(outcome, [None])
+
+
 class CLIContracts(unittest.TestCase):
     def test_cloudinit_update_uses_nested_qm_subcommand(self):
         # Proxmox CLI: qm cloudinit update <vmid>, unlike qm start <vmid>.
@@ -101,6 +155,14 @@ class EngineTests(unittest.TestCase):
 
     def handle(self, action, **kwargs):
         return self.e.handle({**self.req, 'action': action, **kwargs})
+
+    def test_password_checks_ssh_readiness_in_the_same_request(self):
+        self.handle('create', ssh_key='')
+        self.pve.is_ready = False
+        with self.assertRaises(engine.Refused):
+            self.handle('password')
+        self.pve.is_ready = True
+        self.assertEqual(self.handle('password')['user'], 'vpsadmin')
 
     def test_paid_activation_is_idempotent(self):
         first = self.handle('create')
