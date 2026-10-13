@@ -5,6 +5,7 @@ services:
       dockerfile: docker/Dockerfile
     environment:
       PORTAL_BRIDGE_TOKEN: ${PORTAL_BRIDGE_TOKEN:-}
+      ADMIN_PORTAL_BRIDGE_TOKEN: ${ADMIN_PORTAL_BRIDGE_TOKEN:-}
     restart: unless-stopped
     ports:
       - "127.0.0.1:8088:80"
@@ -12,6 +13,23 @@ services:
       - billing:/var/www/html
       - ./.secrets/transport:/run/proxmox:ro
     depends_on:
+      db:
+        condition: service_healthy
+    networks: [billing]
+  admin-worker:
+    profiles: [admin]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    entrypoint: [/usr/local/bin/php, /opt/pilot/admin-worker.php]
+    user: "33:33"
+    restart: unless-stopped
+    volumes:
+      - billing:/var/www/html
+      - ./.secrets/transport:/run/proxmox:ro
+    depends_on:
+      billing:
+        condition: service_started
       db:
         condition: service_healthy
     networks: [billing]

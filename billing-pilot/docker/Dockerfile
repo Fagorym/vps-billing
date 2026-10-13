@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssh-client 
 COPY fossbilling/SafehostProxmox.php /opt/pilot/SafehostProxmox.php
 COPY fossbilling/install.php fossbilling/seed.php /opt/pilot/
 COPY fossbilling/PortalBridge.php fossbilling/portal.php fossbilling/install-portal.php /opt/pilot/
+COPY fossbilling/AdminBridge.php fossbilling/EngineGateway.php fossbilling/admin-portal.php fossbilling/admin-worker.php /opt/pilot/
 COPY config.json /opt/pilot/config.json
 COPY fossbilling/mod_servicecustom_manage.html.twig /opt/pilot/mod_servicecustom_manage.html.twig
 # Servicecustom 0.8.8 requires Plugin/... relative to PHP include_path.

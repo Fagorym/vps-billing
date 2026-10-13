@@ -13,6 +13,7 @@ final class PortalBridge
         $this->db->exec('PRAGMA busy_timeout=30000');
         $this->db->exec('CREATE TABLE IF NOT EXISTS client (account TEXT PRIMARY KEY, client_id INTEGER NOT NULL UNIQUE)');
         $this->db->exec('CREATE TABLE IF NOT EXISTS orders (reference TEXT PRIMARY KEY, account TEXT NOT NULL UNIQUE, plan TEXT NOT NULL, order_id INTEGER UNIQUE)');
+        $this->db->exec('CREATE TABLE IF NOT EXISTS retired_orders (reference TEXT PRIMARY KEY, account TEXT NOT NULL, plan TEXT NOT NULL, order_id INTEGER UNIQUE)');
         chmod($directory . '/portal.sqlite', 0600);
         file_put_contents($directory . '/.htaccess', "Require all denied\n");
     }
@@ -23,6 +24,18 @@ final class PortalBridge
     private function write(string $sql, array $args): void
     {
         $s = $this->db->prepare($sql); $s->execute($args);
+    }
+    private function info(int $client, int $id): array
+    {
+        try {
+            $order = $this->foss->get($id);
+            if ((int) $order['client_id'] !== $client) { throw new DomainException('Ownership changed'); }
+            return $this->foss->call($client, $id, 'readiness');
+        } catch (OutOfBoundsException $e) {
+            // Native order_delete retains the VM. Only a persisted owner binding may
+            // read that engine tombstone; no lifecycle or password call uses this path.
+            return $this->foss->boundStatus($client, $id);
+        }
     }
     public function handle(array $r): array
     {
@@ -41,12 +54,27 @@ final class PortalBridge
         if (!$lock || !flock($lock, $mode)) { throw new RuntimeException('Bridge unavailable'); }
         try {
             $row = $this->row('SELECT * FROM orders WHERE reference=?', [$r['reference']]);
+            if (!$row) { $row = $this->row('SELECT * FROM retired_orders WHERE reference=?', [$r['reference']]); }
             if ($r['action'] === 'create') {
                 if (!in_array($r['plan'] ?? '', ['mini', 'small', 'medium'], true)) { throw new InvalidArgumentException('Invalid plan'); }
                 if ($row && ($row['account'] !== $r['account'] || $row['plan'] !== $r['plan'])) { throw new DomainException('Reference conflict'); }
                 if (!$row) {
-                    if ($this->row('SELECT * FROM orders WHERE account=?', [$r['account']])) { throw new DomainException('One VPS per account'); }
+                    $previous = $this->row('SELECT * FROM orders WHERE account=?', [$r['account']]);
+                    if ($previous) {
+                        $binding = $this->row('SELECT client_id FROM client WHERE account=?', [$r['account']]);
+                        if (!$binding || !$previous['order_id'] || ($this->info((int) $binding['client_id'], (int) $previous['order_id'])['phase'] ?? '') !== 'deleted') {
+                            throw new DomainException('One VPS per account');
+                        }
+                        $this->db->beginTransaction();
+                        try {
+                            $this->write('INSERT INTO retired_orders SELECT * FROM orders WHERE reference=?', [$previous['reference']]);
+                            $this->write('DELETE FROM orders WHERE reference=?', [$previous['reference']]);
+                            $this->write('INSERT INTO orders(reference,account,plan) VALUES(?,?,?)', [$r['reference'], $r['account'], $r['plan']]);
+                            $this->db->commit();
+                        } catch (Throwable $e) { $this->db->rollBack(); throw $e; }
+                    } else {
                     $this->write('INSERT INTO orders(reference,account,plan) VALUES(?,?,?)', [$r['reference'], $r['account'], $r['plan']]);
+                    }
                     $row = $this->row('SELECT * FROM orders WHERE reference=?', [$r['reference']]);
                 }
             }
@@ -66,9 +94,13 @@ final class PortalBridge
                 $row['order_id'] = $id;
             }
             $id = (int) $row['order_id'];
-            $order = $this->foss->get($id);
-            if ((int) $order['client_id'] !== $clientId) { throw new DomainException('Ownership changed'); }
-            if ($r['action'] === 'create' && in_array($order['status'], ['pending_setup', 'failed_setup'], true)) {
+            try { $order = $this->foss->get($id); }
+            catch (OutOfBoundsException $e) {
+                if (!in_array($r['action'], ['create', 'status'], true)) { throw new DomainException('Native order is unavailable'); }
+                $order = null;
+            }
+            if ($order && (int) $order['client_id'] !== $clientId) { throw new DomainException('Ownership changed'); }
+            if ($order && $r['action'] === 'create' && in_array($order['status'], ['pending_setup', 'failed_setup'], true)) {
                 $this->foss->activate($id); $order = $this->foss->get($id);
             }
             if ($r['action'] === 'password') {
@@ -76,12 +108,16 @@ final class PortalBridge
                 // The adapter checks ownership, VM state and SSH readiness in this same call.
                 return $this->foss->call($clientId, $id, 'initial_password');
             }
-            if ($r['action'] === 'stop' && $order['status'] === 'active') { $this->foss->suspend($id); }
-            if ($r['action'] === 'start' && $order['status'] === 'suspended') { $this->foss->unsuspend($id); }
-            $order = $this->foss->get($id);
-            if (!in_array($order['status'], ['active', 'suspended'], true)) { throw new DomainException('VPS unavailable'); }
-            $info = $this->foss->call($clientId, $id, 'readiness');
-            return ['order_id' => $id, 'phase' => $order['status'] === 'suspended' ? 'suspended' : (($info['ready'] ?? false) ? 'ready' : 'preparing'),
+            if (in_array($r['action'], ['start', 'stop'], true)) {
+                if ($order['status'] !== 'active') { throw new DomainException('Owner cannot lift an administrative suspension'); }
+                $this->foss->ownerPower($clientId, $id, $r['action'] === 'start');
+            }
+            $info = $this->info($clientId, $id);
+            $phase = $info['phase'] ?? 'ready';
+            if ($phase === 'stopped' || ($phase === 'ready' && $info['status'] === 'stopped')) { $phase = 'suspended'; }
+            elseif ($phase === 'ready') { $phase = ($info['ready'] ?? false) ? 'ready' : 'preparing'; }
+            elseif (!in_array($phase, ['blocked','archived','deleted','cancelled','missing'], true)) { $phase = 'preparing'; }
+            return ['order_id' => $id, 'phase' => $phase, 'reason' => $info['reason'] ?? null,
                 'status' => $info['status'], 'public_ip' => $info['public_ip'], 'ssh_port' => $info['ssh_port'],
                 'user' => $info['user'], 'ssh' => $info['ssh'], 'vmid' => $info['vmid']];
         } finally { flock($lock, LOCK_UN); fclose($lock); }
@@ -117,10 +153,36 @@ final class FossPortal
         return (int) $this->api->order_create(['client_id' => $client, 'product_id' => $product, 'period' => '1M',
             'title' => $title, 'config' => ['ssh_key' => ''], 'price' => 0, 'invoice_option' => 'no-invoice', 'activate' => false]);
     }
-    public function get(int $id): array { $this->di['em']->clear(); return $this->api->order_get(['id' => $id]); }
+    public function get(int $id): array
+    {
+        $this->di['em']->clear();
+        if (!(int) $this->di['em']->getConnection()->fetchOne('SELECT COUNT(*) FROM client_order WHERE id = ?', [$id])) {
+            throw new OutOfBoundsException('Native order not found');
+        }
+        return $this->api->order_get(['id' => $id]);
+    }
+    public function boundStatus(int $client, int $order): array
+    {
+        require_once __DIR__ . '/EngineGateway.php';
+        $info = (new EngineGateway())->ownerStatus($client, $order);
+        if (!in_array($info['phase'], ['deleted', 'missing'], true)) {
+            $info['phase'] = 'cancelled'; $info['ready'] = false;
+            $info['reason'] = 'Заказ FOSSBilling удалён; управление доступно только администратору';
+        }
+        return $info;
+    }
     public function activate(int $id): void { $this->api->order_activate(['id' => $id]); }
     public function suspend(int $id): void { $this->api->order_suspend(['id' => $id, 'reason' => 'Stopped from owner cabinet']); }
     public function unsuspend(int $id): void { $this->api->order_unsuspend(['id' => $id]); }
+    public function ownerPower(int $client, int $id, bool $start): array
+    {
+        $data = $this->get($id);
+        if ((int) $data['client_id'] !== $client || $data['status'] !== 'active') { throw new DomainException('Owner operation unavailable'); }
+        require_once __DIR__ . '/EngineGateway.php';
+        $result = (new EngineGateway())->ownerPower($client, $id, $start);
+        $this->api->order_update(['id' => $id, 'status' => 'active']);
+        return $result;
+    }
     public function call(int $client, int $order, string $method): array
     {
         // Core Client customCall disallows even read-only status on suspended orders.

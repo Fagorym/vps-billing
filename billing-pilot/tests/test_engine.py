@@ -34,13 +34,23 @@ class FakePVE:
         return self.is_ready
 
     def guests(self):
-        return {i: {'vmid': i, 'node': 'pve1', 'type': v.get('_type', 'qemu')} for i,v in self.vms.items()}
+        return {i: {'vmid': i, 'node': 'pve1', 'type': v.get('_type', 'qemu'), 'template': v.get('template', 0),
+                    'maxmem': int(v.get('memory', 0)) * 1048576, 'maxcpu': int(v.get('cores', 0)),
+                    'status': self.states.get(i, 'stopped'), 'cpu': 0.125, 'mem': 4096} for i,v in self.vms.items()}
+
+    def guest_fs(self, vmid):
+        return None
 
     def config(self, vmid, kind='qemu'):
         return copy.deepcopy(self.vms[vmid])
 
     def check_capacity(self, plan):
         pass
+
+    def api(self, path, **params):
+        if '/storage/' in path:
+            return {'avail': 100 * 1073741824, 'total': 200 * 1073741824, 'used': 100 * 1073741824}
+        return {'memory': {'total': 64 * 1073741824, 'used': 1073741824}, 'cpu': 0.2, 'cpuinfo': {'cpus': 8}}
 
     def status(self, vmid):
         return self.states[vmid]
@@ -69,6 +79,11 @@ class FakePVE:
             if verb == 'start' and self.crash_after_start:
                 self.crash_after_start = False
                 raise OSError('lost start response')
+        elif verb == 'shutdown':
+            self.states[vmid] = 'stopped'
+        elif verb == 'destroy':
+            del self.vms[vmid]
+            del self.states[vmid]
 
 
 class CLILockingContracts(unittest.TestCase):

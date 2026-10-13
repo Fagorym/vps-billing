@@ -67,6 +67,19 @@ def prepare():
         raise ValueError('Portal token и .env не совпадают; восстановите исходный секрет')
     if configured is None:
         env.write_text(text.rstrip() + '\nPORTAL_BRIDGE_TOKEN=' + token + '\n')
+    admin_file = ROOT / '.secrets/admin-portal-token'
+    if admin_file.is_symlink():
+        raise ValueError('Admin token не должен быть symlink')
+    text = env.read_text()
+    admin_configured = next((line.split('=', 1)[1] for line in text.splitlines() if line.startswith('ADMIN_PORTAL_BRIDGE_TOKEN=')), None)
+    if not admin_file.exists():
+        admin_file.write_text((admin_configured or secrets.token_hex(32)) + '\n')
+    admin_file.chmod(0o600)
+    admin_token = admin_file.read_text().strip()
+    if len(admin_token) < 32 or admin_token == token or admin_configured is not None and admin_configured != admin_token:
+        raise ValueError('Admin token должен совпадать с .env и отличаться от owner token')
+    if admin_configured is None:
+        env.write_text(text.rstrip() + '\nADMIN_PORTAL_BRIDGE_TOKEN=' + admin_token + '\n')
     credentials.chmod(0o600)
     env.chmod(0o600)
     for key in (ROOT / '.secrets/admin_ed25519', ROOT / '.secrets/transport/id_ed25519'):
@@ -221,7 +234,9 @@ def main():
         install_local()
         if args.action == 'test':
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/portal-unit.php', demo=True)
+            compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/admin-unit.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/e2e.php', demo=True)
+            compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/admin-e2e.php', demo=True)
             compose('down', '-v', demo=True)
             print('Тестовый проект и его временные volumes удалены. Данные demo и сервера сохранены.', flush=True)
             return

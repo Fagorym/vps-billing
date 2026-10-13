@@ -2,6 +2,7 @@ services:
   billing:
     environment:
       PORTAL_BRIDGE_TOKEN: test-token-with-at-least-thirty-two-characters
+      ADMIN_PORTAL_BRIDGE_TOKEN: separate-admin-token-with-at-least-thirty-two-characters
     volumes:
       - ./tests:/tests:ro
       - ./tests/ssh-demo.php:/usr/bin/ssh:ro
