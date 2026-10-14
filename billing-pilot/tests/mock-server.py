@@ -42,7 +42,7 @@ class Handler(BaseHTTPRequestHandler):
             result = e.handle(json.loads(self.rfile.read(size)))
             response = {'ok': True, 'result': result}
         except (ValueError, OSError, KeyError) as exc:
-            response = {'ok': False, 'error': str(exc)}
+            response = {'ok': False, 'error': str(exc), 'code': 'refused' if isinstance(exc, engine.Refused) else 'temporary'}
         finally:
             e.db.close()
             saved.write_text(json.dumps({'vms': pve.vms, 'states': pve.states, 'calls': pve.calls}))

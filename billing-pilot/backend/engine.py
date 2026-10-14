@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Restricted SSH command. Only owned VMs, no arbitrary commands or deletion."""
+"""Restricted SSH command. Only marked owned VMs, no arbitrary commands."""
 import base64
 import fcntl
 import hashlib
@@ -15,6 +15,8 @@ import sqlite3
 import struct
 import subprocess
 import sys
+from datetime import datetime, timezone
+import uuid
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -49,7 +51,8 @@ def fingerprint(value):
 
 def run(args):
     result = subprocess.run(args, capture_output=True, text=True, timeout=900)
-    require(result.returncode == 0, 'Proxmox отклонил операцию; смотрите журнал хоста')
+    if result.returncode != 0:
+        raise OSError('Сбой выполнения команды Proxmox; смотрите журнал хоста')
     return result.stdout
 
 
@@ -123,6 +126,19 @@ class Proxmox:
         except (OSError, ValueError, subprocess.TimeoutExpired):
             return False
 
+    def guest_fs(self, vmid):
+        try:
+            result = subprocess.run(['/usr/sbin/qm', 'guest', 'cmd', str(vmid), 'get-fsinfo'],
+                                    capture_output=True, text=True, timeout=3)
+            if result.returncode == 0:
+                filesystems = json.loads(result.stdout)
+                root = next((fs for fs in filesystems if fs.get('mountpoint') == '/'), None)
+                if root and all(type(root.get(k)) is int for k in ('used-bytes', 'total-bytes')):
+                    return root['used-bytes'], root['total-bytes']
+        except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+            pass
+        return None
+
 
 class Engine:
     def __init__(self, config, state, snippets, pve=None):
@@ -140,6 +156,17 @@ class Engine:
             phase TEXT NOT NULL DEFAULT 'reserved')''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS credential (
             order_id INTEGER PRIMARY KEY, encrypted BLOB NOT NULL, password_hash TEXT NOT NULL)''')
+        self.db.execute('BEGIN IMMEDIATE')
+        columns = {r[1] for r in self.db.execute('PRAGMA table_info(allocation)')}
+        for name in ('reason', 'created_at'):
+            if name not in columns:
+                self.db.execute(f'ALTER TABLE allocation ADD COLUMN {name} TEXT')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS retired_allocation (
+            order_id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL, slot INTEGER NOT NULL,
+            spec TEXT NOT NULL, phase TEXT NOT NULL, reason TEXT, created_at TEXT)''')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS admin_operation (
+            id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, order_id INTEGER NOT NULL,
+            state TEXT NOT NULL, result TEXT)''')
         self.db.commit()
         config_hash = self.state / 'config.sha256'
         digest = fingerprint(config)
@@ -156,9 +183,9 @@ class Engine:
     def vmid(self, row):
         return self.c['vm_first'] + row['slot']
 
-    def owned_config(self, row):
+    def owned_config(self, row, guests=None):
         vmid = self.vmid(row)
-        guest = self.pve.guests().get(vmid)
+        guest = (guests if guests is not None else self.pve.guests()).get(vmid)
         require(guest is not None and guest['node'] == self.c['node'] and guest['type'] == 'qemu',
                 'Управляемая VM не найдена на заданном узле')
         cfg = self.pve.config(vmid)
@@ -167,6 +194,13 @@ class Engine:
         require(not cfg.get('lock'), 'VM заблокирована; повторите после завершения задачи')
         require('bridge=' + self.c['bridge'] in cfg.get('net0', '').split(','), 'Изменилась сеть VM')
         require(not any(re.fullmatch(r'net[1-9]\d*', k) for k in cfg), 'У VM появилась дополнительная сеть')
+        require(not cfg.get('hookscript'), 'У VM появился сторонний lifecycle hook')
+        require(not any(re.fullmatch(r'(?:unused|tpmstate)\d+', k) for k in cfg), 'У VM появились неучтённые тома')
+        if row['phase'] != 'reserved':
+            ip = str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])
+            fields = dict(part.split('=', 1) for part in cfg.get('ipconfig0', '').split(',') if '=' in part)
+            require(fields == {'ip': ip + '/24', 'gw': self.c['gateway']}, 'Изменилась адресация VM')
+            require(not any(re.fullmatch(r'ipconfig[1-9]\d*', k) for k in cfg), 'У VM появилась дополнительная адресация')
         for disk in ('scsi0', 'efidisk0', 'ide2'):
             if disk in cfg:
                 require(re.fullmatch(re.escape(self.c['storage']) + ':vm-' + str(vmid) + r'-[a-z0-9-]+',
@@ -176,6 +210,8 @@ class Engine:
         return cfg
 
     def reserve(self, order, client, spec):
+        require(not self.db.execute('SELECT 1 FROM retired_allocation WHERE order_id=?', (order,)).fetchone(),
+                'Заказ удалён; повторная выдача запрещена')
         row = self.db.execute('SELECT * FROM allocation WHERE order_id=?', (order,)).fetchone()
         if row:
             require(row['client_id'] == client and json.loads(row['spec']) == spec,
@@ -239,9 +275,146 @@ class Engine:
         self.db.execute('UPDATE allocation SET phase=? WHERE order_id=?', (value, row['order_id']))
         self.db.commit()
 
+    @staticmethod
+    def now():
+        return datetime.now(timezone.utc).isoformat()
+
+    def capacity(self, plan, restoring=None):
+        guests = self.pve.guests()
+        excluded = set()
+        target_memory = plan['memory_mb'] * 1048576
+        for row in self.db.execute('SELECT * FROM allocation'):
+            vmid = self.vmid(row)
+            if (row['phase'] == 'archived' and guests.get(vmid, {}).get('status') == 'stopped') or (restoring and row['order_id'] == restoring['order_id']):
+                if vmid in guests:
+                    cfg = self.owned_config(row, guests)
+                    if restoring and row['order_id'] == restoring['order_id']:
+                        memory = cfg.get('memory')
+                        require(type(memory) in (int, str) and str(memory).isdigit() and int(memory) > 0,
+                                'Не удалось проверить фактическую RAM восстанавливаемой VM')
+                        target_memory = int(memory) * 1048576
+                    excluded.add(vmid)
+        reserved = sum(int(v.get('maxmem', 0)) for vmid, v in guests.items()
+                       if v['node'] == self.c['node'] and not v.get('template') and vmid not in excluded)
+        node = self.pve.api(f'/nodes/{self.c["node"]}/status')
+        require(reserved + target_memory <= node['memory']['total'] - 2 * 1073741824,
+                'Недостаточно RAM с резервом 2 GiB для хоста')
+        if restoring is None:
+            storage = self.pve.api(f'/nodes/{self.c["node"]}/storage/{self.c["storage"]}/status')
+            require(int(storage['avail']) >= (plan['disk_gb'] + 5) * 1073741824, 'Недостаточно места на диске')
+
+    def stop_vm(self, row):
+        vmid = self.vmid(row)
+        self.pve.command('set', vmid, '--onboot', '0')
+        if self.pve.status(vmid) == 'running':
+            try:
+                self.pve.command('shutdown', vmid, '--timeout', '30')
+            except (Refused, OSError, subprocess.TimeoutExpired):
+                pass
+            if self.pve.status(vmid) != 'stopped':
+                self.pve.command('stop', vmid)
+
+    def power(self, row, start, phase=None):
+        self.owned_config(row)
+        if start:
+            self.pve.command('set', self.vmid(row), '--onboot', '1')
+            if self.pve.status(self.vmid(row)) != 'running':
+                self.pve.command('start', self.vmid(row))
+        else:
+            self.stop_vm(row)
+        self.phase(row, phase or ('ready' if start else 'stopped'))
+        return self.info(row)
+
+    def admin(self, row, request):
+        command = request.get('command')
+        require(command in ('start', 'stop', 'block', 'unblock', 'archive', 'restore', 'purge'), 'Недопустимая операция')
+        try:
+            operation = str(uuid.UUID(request.get('operation_id', '')))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise Refused('Нужен UUID операции') from exc
+        reason = request.get('reason')
+        require(isinstance(reason, str) and 3 <= len(reason.strip()) <= 500, 'Укажите причину операции')
+        actor = request.get('actor')
+        require(isinstance(actor, dict) and isinstance(actor.get('email'), str) and '@' in actor['email'], 'Нужен оператор')
+        try:
+            uuid.UUID(actor.get('account', ''))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise Refused('Нужен UUID оператора') from exc
+        digest = fingerprint(request)
+        prior = self.db.execute('SELECT * FROM admin_operation WHERE id=?', (operation,)).fetchone()
+        if prior:
+            require(prior['fingerprint'] == digest, 'UUID операции уже использован с другими данными')
+            if prior['state'] == 'done':
+                return json.loads(prior['result'])
+            require(prior['state'] != 'failed', 'Операция отклонена; создайте новую операцию')
+        else:
+            self.db.execute('INSERT INTO admin_operation(id,fingerprint,order_id,state) VALUES(?,?,?,?)',
+                            (operation, digest, row['order_id'], 'pending'))
+            self.db.commit()
+        try:
+            result = self.admin_effect(row, command, request)
+        except Refused:
+            self.db.execute('UPDATE admin_operation SET state=? WHERE id=?', ('failed', operation))
+            self.db.commit()
+            raise
+        self.db.execute('UPDATE admin_operation SET state=?,result=? WHERE id=?', ('done', json.dumps(result), operation))
+        self.db.commit()
+        return result
+
+    def admin_effect(self, row, command, request):
+        phase = row['phase']
+        if command == 'purge':
+            require(type(request.get('confirm_vmid')) is int and request['confirm_vmid'] == self.vmid(row),
+                    'Подтвердите точный VMID')
+            if phase == 'deleted':
+                return self.info(row)
+            guests = self.pve.guests()
+            if self.vmid(row) in guests:
+                self.owned_config(row, guests)
+                self.phase(row, 'purging')
+                self.stop_vm(row)
+                self.owned_config(row)
+                self.pve.command('set', self.vmid(row), '--protection', '0')
+                self.pve.command('destroy', self.vmid(row), '--purge', '1')
+            else:
+                require(phase == 'purging', 'VM исчезла; автоматическое удаление неизвестных дисков запрещено')
+            # The slot cannot be reused until this atomic retirement and credential cleanup.
+            (self.snippets / f'safehost-billing-{self.vmid(row)}.yaml').unlink(missing_ok=True)
+            with self.db:
+                self.db.execute('INSERT OR IGNORE INTO retired_allocation VALUES(?,?,?,?,?,?,?)',
+                                (row['order_id'], row['client_id'], row['slot'], row['spec'], 'deleted',
+                                 request['reason'].strip(), row['created_at']))
+                self.db.execute('DELETE FROM credential WHERE order_id=?', (row['order_id'],))
+                self.db.execute('DELETE FROM allocation WHERE order_id=?', (row['order_id'],))
+            retired = self.db.execute('SELECT * FROM retired_allocation WHERE order_id=?', (row['order_id'],)).fetchone()
+            return self.info(retired)
+        require(phase != 'deleted', 'Заказ удалён')
+        self.owned_config(row)
+        if command in ('start', 'unblock'):
+            allowed = ('ready', 'stopped', 'blocked', 'suspended') if command == 'unblock' else ('ready', 'stopped')
+            require(phase in allowed, 'Запуск запрещён состоянием заказа')
+            result = self.power(row, True)
+        elif command in ('stop', 'block'):
+            require(phase in ('ready', 'stopped', 'blocked', 'suspended'), 'Остановка запрещена состоянием заказа')
+            target = 'blocked' if command == 'block' or phase in ('blocked', 'suspended') else 'stopped'
+            result = self.power(row, False, target)
+        elif command == 'archive':
+            require(phase in ('ready', 'stopped', 'blocked', 'suspended', 'cancelled', 'archived', 'archiving'),
+                    'Создание не завершено')
+            self.phase(row, 'archiving')
+            result = self.power(row, False, 'archived')
+        else:
+            require(phase in ('archived', 'restoring'), 'Восстановление доступно только из архива')
+            self.capacity(self.c['plans'][json.loads(row['spec'])['plan']], restoring=row)
+            self.phase(row, 'restoring')
+            result = self.power(row, True)
+        self.db.execute('UPDATE allocation SET reason=? WHERE order_id=?', (request['reason'].strip(), row['order_id']))
+        self.db.commit()
+        return self.info(row)
+
     def create(self, row):
         require(row['phase'] != 'cancelled', 'Заказ отменён; диск сохранён, новая активация запрещена')
-        require(row['phase'] != 'suspended', 'VPS приостановлен; используйте unsuspend')
+        require(row['phase'] in ('reserved', 'configured', 'ready'), 'Повторная активация запрещена состоянием VPS')
         vmid, spec = self.vmid(row), json.loads(row['spec'])
         plan = self.c['plans'][spec['plan']]
         if vmid not in self.pve.guests():
@@ -251,10 +424,13 @@ class Engine:
             template = self.pve.config(self.c['template_id'])
             require(template.get('template') and template.get('description') == self.c['template_marker'],
                     'Шаблон не принадлежит proxmox-pilot')
-            self.pve.check_capacity(plan)
+            self.capacity(plan)
             self.pve.command('clone', self.c['template_id'], vmid, '--full', '1', '--storage', self.c['storage'],
                              '--name', f'vps-order-{row["order_id"]}', '--description', self.marker(row))
         cfg = self.owned_config(row)
+        if not row['created_at'] and row['phase'] == 'reserved':
+            self.db.execute('UPDATE allocation SET created_at=? WHERE order_id=?', (self.now(), row['order_id']))
+            self.db.commit()
         if row['phase'] == 'ready':
             return self.info(row)  # An activation retry must never reboot or reconfigure a guest.
         require(self.pve.status(vmid) == 'stopped', 'Незавершённая VM запущена; нужна проверка администратором')
@@ -303,19 +479,72 @@ class Engine:
         return self.info(row)
 
     def info(self, row):
-        self.owned_config(row)
-        current = self.db.execute('SELECT phase FROM allocation WHERE order_id=?', (row['order_id'],)).fetchone()[0]
+        current_row = self.db.execute('SELECT * FROM allocation WHERE order_id=?', (row['order_id'],)).fetchone()
+        current = current_row['phase'] if current_row else 'deleted'
+        reason = current_row['reason'] if current_row else row['reason']
+        ownership, status = 'deleted', 'stopped'
+        if current != 'deleted':
+            if self.vmid(row) not in self.pve.guests():
+                ownership, current, reason = 'missing', 'missing', 'Управляемая VM отсутствует на узле'
+            else:
+                try:
+                    self.owned_config(row)
+                    ownership, status = 'owned', self.pve.status(self.vmid(row))
+                except Refused:
+                    ownership, current, reason = 'foreign', 'missing', 'VMID занят чужой VM или изменены её защищённые параметры'
+        if current in ('suspended', 'blocked'):
+            current = 'blocked'
+        elif current == 'ready' and status == 'stopped':
+            current = 'stopped'
         return {'vmid': self.vmid(row), 'public_ip': self.c['public_ip'],
                 'private_ip': str(ipaddress.ip_address(self.c['ip_first']) + row['slot']),
                 'ssh_port': self.c['ssh_port_first'] + row['slot'], 'user': 'vpsadmin',
                 'auth_mode': 'password' if json.loads(row['spec'])['ssh_key'] is None else 'key',
-                'phase': current, 'status': self.pve.status(self.vmid(row)),
+                'phase': current, 'status': status, 'reason': reason, 'ownership': ownership,
                 'ssh': f'ssh -p {self.c["ssh_port_first"] + row["slot"]} vpsadmin@{self.c["public_ip"]}'}
+
+    def monitor(self):
+        guests = self.pve.guests()
+        excluded = set()
+        servers = []
+        rows = list(self.db.execute('SELECT * FROM allocation')) + list(self.db.execute('SELECT * FROM retired_allocation'))
+        for row in rows:
+            info = self.info(row)
+            plan = self.c['plans'][json.loads(row['spec'])['plan']]
+            metrics = dict.fromkeys(('cpuFraction', 'memoryUsedBytes', 'memoryTotalBytes', 'guestDiskUsedBytes', 'guestDiskTotalBytes'))
+            if info['ownership'] == 'owned':
+                guest = guests[self.vmid(row)]
+                metrics.update(cpuFraction=guest.get('cpu'), memoryUsedBytes=guest.get('mem'), memoryTotalBytes=guest.get('maxmem'))
+                fs = self.pve.guest_fs(self.vmid(row)) if info['status'] == 'running' else None
+                if fs:
+                    metrics.update(guestDiskUsedBytes=fs[0], guestDiskTotalBytes=fs[1])
+                if row['phase'] == 'archived' and info['status'] == 'stopped':
+                    excluded.add(self.vmid(row))
+            servers.append({**info, 'orderId': row['order_id'], 'clientId': row['client_id'], 'node': self.c['node'],
+                            'plan': json.loads(row['spec'])['plan'], 'cores': plan['cores'], 'memoryMb': plan['memory_mb'],
+                            'diskGb': plan['disk_gb'], 'createdAt': row['created_at'], 'metrics': metrics})
+        node = self.pve.api(f'/nodes/{self.c["node"]}/status')
+        storage = self.pve.api(f'/nodes/{self.c["node"]}/storage/{self.c["storage"]}/status')
+        reserved = [v for vmid, v in guests.items() if v['node'] == self.c['node'] and not v.get('template') and vmid not in excluded]
+        occupied = {r['slot'] for r in self.db.execute('SELECT slot FROM allocation')}
+        ips = declared_ips(self.pve, self.c['node'])
+        free_slots = sum(i not in occupied and self.c['vm_first'] + i not in guests
+                         and str(ipaddress.ip_address(self.c['ip_first']) + i) not in ips
+                         for i in range(self.c['slots']))
+        host = {'node': self.c['node'], 'cpuFraction': node.get('cpu'), 'cpuCores': node.get('cpuinfo', {}).get('cpus'),
+                'memoryUsedBytes': node['memory']['used'], 'memoryTotalBytes': node['memory']['total'],
+                'memoryReservedBytes': sum(int(v.get('maxmem', 0)) for v in reserved),
+                'vcpuReserved': sum(int(v.get('maxcpu', 0)) for v in reserved), 'storageUsedBytes': storage.get('used'),
+                'storageTotalBytes': storage['total'], 'storageFreeBytes': storage['avail'], 'slotsFree': free_slots}
+        return {'hosts': [host], 'servers': servers}
 
     def handle(self, request):
         require(isinstance(request, dict), 'Ожидается JSON object')
         action = request.get('action')
-        require(action in ('create', 'status', 'readiness', 'password', 'suspend', 'unsuspend', 'cancel'), 'Недопустимая операция')
+        require(action in ('create', 'status', 'readiness', 'password', 'suspend', 'unsuspend', 'cancel',
+                           'owner_start', 'owner_stop', 'admin', 'monitor'), 'Недопустимая операция')
+        if action == 'monitor':
+            return self.monitor()
         order, client = request.get('order_id'), request.get('client_id')
         require(type(order) is int and 1 <= order < 2147483647 and type(client) is int and 1 <= client < 2147483647,
                 'Нужны целочисленные order_id и client_id')
@@ -333,27 +562,41 @@ class Engine:
                 return self.info(row)
             return self.create(row)
         row = self.db.execute('SELECT * FROM allocation WHERE order_id=?', (order,)).fetchone()
+        if row is None:
+            row = self.db.execute('SELECT * FROM retired_allocation WHERE order_id=?', (order,)).fetchone()
+        if action == 'cancel' and row is None:
+            return {'phase': 'cancelled', 'status': 'stopped'}
         require(row is not None and row['client_id'] == client, 'VPS этого клиента не найден')
+        if action == 'cancel' and row['phase'] == 'deleted':
+            return self.info(row)
+        if action in ('status', 'readiness'):
+            info = self.info(row)
+            if action == 'readiness':
+                info['ready'] = (info['ownership'] == 'owned' and info['phase'] == 'ready' and info['status'] == 'running'
+                                 and self.pve.ready(self.vmid(row), info['private_ip']))
+            return info
+        if action == 'admin':
+            return self.admin(row, request)
+        require(row['phase'] != 'deleted', 'Заказ удалён')
         self.owned_config(row)
         if action == 'password':
             return self.initial_password(row)
-        if action == 'status':
-            return self.info(row)
-        if action == 'readiness':
-            info = self.info(row)
-            info['ready'] = (row['phase'] == 'ready' and info['status'] == 'running'
-                             and self.pve.ready(self.vmid(row), info['private_ip']))
-            return info
+        if action == 'cancel' and row['phase'] in ('archived', 'archiving'):
+            return self.power(row, False, 'archived')
+        if action in ('owner_start', 'owner_stop'):
+            require(row['phase'] in ('ready', 'stopped'), 'VPS заблокирован, архивирован или удалён')
+            require(not self.db.execute('SELECT 1 FROM admin_operation WHERE order_id=? AND state=?', (order, 'pending')).fetchone(),
+                    'Административная операция ещё выполняется')
+            return self.power(row, action == 'owner_start')
         require(row['phase'] != 'cancelled' or action == 'cancel', 'Заказ отменён; операция запрещена')
-        require(row['phase'] in ('ready', 'suspended', 'cancelled'), 'Создание не завершено; сначала повторите активацию')
-        require(action != 'unsuspend' or row['phase'] != 'cancelled', 'Заказ отменён; запуск запрещён')
-        desired = 'running' if action == 'unsuspend' else 'stopped'
-        # Cancel/suspend disables autostart too: rebooting the host must not lift suspension.
-        self.pve.command('set', self.vmid(row), '--onboot', '1' if action == 'unsuspend' else '0')
-        if self.pve.status(self.vmid(row)) != desired:
-            self.pve.command('start' if desired == 'running' else 'stop', self.vmid(row))
-        self.phase(row, {'suspend': 'suspended', 'unsuspend': 'ready', 'cancel': 'cancelled'}[action])
-        return self.info(row)
+        require(row['phase'] in ('ready', 'stopped', 'suspended', 'blocked', 'cancelled'), 'Создание не завершено или VPS архивирован')
+        require(action != 'unsuspend' or row['phase'] not in ('cancelled', 'blocked'),
+                'Терминальный заказ или административная блокировка; запуск запрещён')
+        # Native billing resume can lift its own suspension, never an explicit
+        # audited admin block. Native suspend must preserve a pre-existing block.
+        target = {'suspend': 'blocked' if row['phase'] == 'blocked' else 'suspended',
+                  'unsuspend': 'ready', 'cancel': 'cancelled'}[action]
+        return self.power(row, action == 'unsuspend', target)
 
 
 def main():
@@ -367,7 +610,7 @@ def main():
     request = json.loads(raw)
     require(isinstance(request, dict), 'Ожидается JSON object')
     with (state / 'operation.lock').open('a') as lock:
-        read_only = request.get('action') in ('status', 'readiness', 'password')
+        read_only = request.get('action') in ('status', 'readiness', 'password', 'monitor')
         try:
             fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB if read_only else fcntl.LOCK_EX)
         except BlockingIOError as exc:
@@ -384,5 +627,5 @@ if __name__ == '__main__':
     try:
         main()
     except (ValueError, OSError, KeyError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
-        print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False))
+        print(json.dumps({'ok': False, 'error': str(exc), 'code': 'refused' if isinstance(exc, Refused) else 'temporary'}, ensure_ascii=False))
         sys.exit(1)

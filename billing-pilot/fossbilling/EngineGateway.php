@@ -1,0 +1,49 @@
+<?php
+declare(strict_types=1);
+
+/** Server-only adapter. This class is not a Servicecustom plugin. */
+final class EngineGateway
+{
+    private function request(array $payload): array
+    {
+        $argv = ['/usr/bin/ssh', '-T', '-i', '/run/proxmox/id_ed25519', '-o', 'IdentitiesOnly=yes',
+            '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=/run/proxmox/known_hosts',
+            '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', 'root@10.10.10.1'];
+        set_time_limit(950);
+        $process = proc_open($argv, [['pipe', 'r'], ['pipe', 'w'], ['file', '/dev/null', 'a']], $pipes);
+        if (!is_resource($process)) { throw new RuntimeException('Engine unavailable'); }
+        fwrite($pipes[0], json_encode($payload, JSON_THROW_ON_ERROR)); fclose($pipes[0]);
+        stream_set_timeout($pipes[1], 930);
+        $output = stream_get_contents($pipes[1], 1048576); $meta = stream_get_meta_data($pipes[1]); fclose($pipes[1]);
+        if ($meta['timed_out']) { proc_terminate($process); }
+        $rc = proc_close($process); $reply = json_decode($output ?: '', true);
+        if ($rc !== 0 || !is_array($reply) || ($reply['ok'] ?? false) !== true) {
+            if (($reply['code'] ?? '') === 'refused') { throw new DomainException('Operation refused by engine state or capacity checks'); }
+            throw new RuntimeException('Engine temporarily unavailable');
+        }
+        if (!is_array($reply['result'] ?? null)) { throw new RuntimeException('Invalid engine response'); }
+        return $reply['result'];
+    }
+    public function monitoring(): array { return $this->request(['action' => 'monitor']); }
+    public function state(int $client,int $order): array
+    {
+        try{return $this->request(['action'=>'status','client_id'=>$client,'order_id'=>$order]);}
+        catch(DomainException $e){throw new RuntimeException('Engine state temporarily unavailable');}
+    }
+    public function cancel(int $client,int $order): array {return $this->request(['action'=>'cancel','client_id'=>$client,'order_id'=>$order]);}
+    public function ownerStatus(int $client, int $order): array
+    {
+        return $this->request(['action' => 'readiness', 'client_id' => $client, 'order_id' => $order]);
+    }
+    public function ownerPower(int $client, int $order, bool $start): array
+    {
+        return $this->request(['action' => $start ? 'owner_start' : 'owner_stop', 'client_id' => $client, 'order_id' => $order]);
+    }
+    public function action(array $order, string $command, array $request): array
+    {
+        $payload = ['action' => 'admin', 'order_id' => (int) $order['id'], 'client_id' => (int) $order['client_id'],
+            'command' => $command, 'operation_id' => $request['operationId'], 'reason' => $request['reason'], 'actor' => $request['actor']];
+        if ($command === 'purge') { $payload['confirm_vmid'] = $request['confirmVmid']; }
+        return $this->request($payload);
+    }
+}
