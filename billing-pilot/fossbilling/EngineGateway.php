@@ -25,6 +25,12 @@ final class EngineGateway
         return $reply['result'];
     }
     public function monitoring(): array { return $this->request(['action' => 'monitor']); }
+    public function state(int $client,int $order): array
+    {
+        try{return $this->request(['action'=>'status','client_id'=>$client,'order_id'=>$order]);}
+        catch(DomainException $e){throw new RuntimeException('Engine state temporarily unavailable');}
+    }
+    public function cancel(int $client,int $order): array {return $this->request(['action'=>'cancel','client_id'=>$client,'order_id'=>$order]);}
     public function ownerStatus(int $client, int $order): array
     {
         return $this->request(['action' => 'readiness', 'client_id' => $client, 'order_id' => $order]);

@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 require_once __DIR__ . '/EngineGateway.php';
+require_once __DIR__ . '/FinanceLifecycle.php';
 
 final class AdminBridge
 {
@@ -167,6 +168,7 @@ final class AdminBridge
         if (!$worker || !flock($worker, LOCK_EX | LOCK_NB)) { return false; }
         try {
             return $this->locked(true, function() use ($force): bool {
+                if(method_exists($this->foss,'recoverNativeFinance')&&$this->foss->recoverNativeFinance($this->engine,$force))return true;
                 $query = "SELECT * FROM admin_operation WHERE state IN ('pending','running')" . ($force ? '' : ' AND next_attempt<=?') . ' ORDER BY created_at,id LIMIT 1';
                 $row = $this->row($query, $force ? [] : [self::now()]); if (!$row) { return false; }
                 $this->write('UPDATE admin_operation SET state=?,error=NULL WHERE id=?', ['running',$row['id']]);
@@ -189,11 +191,12 @@ final class AdminBridge
 
 final class FossAdmin
 {
-    private object $api; private array $catalog; private FossPortal $portal;
+    private object $api; private array $catalog; private FossPortal $portal; private FinanceLifecycle $finance;
     public function __construct(private $di)
     {
         require_once __DIR__ . '/PortalBridge.php';
         $this->portal = new FossPortal($di); $this->api = $di['api_admin'];
+        $this->finance=FinanceLifecycle::fromDi($di);
         $this->catalog = json_decode(file_get_contents('/var/www/html/data/pilot-catalog.json'), true, 512, JSON_THROW_ON_ERROR)['products'];
     }
     public function client(string $account): int { return $this->portal->client($account); }
@@ -258,11 +261,22 @@ final class FossAdmin
     {
         $id = (int) $order['id'];
         if (($order['nativeMissing'] ?? false) && !in_array($command, ['archive','restore','purge'], true)) { throw new DomainException('Native order is absent'); }
+        if(in_array($command,['archive','purge','restore'],true)){
+            $state=$engine->state((int)$order['client_id'],$id);
+            if($command==='purge'&&($state['vmid']??null)!==$request['confirmVmid'])throw new DomainException('VMID confirmation mismatch');
+            if(($state['ownership']??'')!=='owned'&&!($command==='purge'&&($state['phase']??'')==='deleted'))throw new DomainException('Managed VM unavailable');
+            $allowed=match($command){'archive'=>['ready','stopped','blocked','suspended','cancelled','archived','archiving'],'restore'=>['archived','restoring','ready'],default=>null};
+            if($allowed!==null&&!in_array($state['phase'],$allowed,true))throw new DomainException('VM state does not permit lifecycle');
+            $this->finance->prepare($order,$command,$request);
+        }
+        elseif(in_array($command,['start','unblock'],true))$this->finance->check($order,$command,$request);
         $result = $engine->action($order, $command, $request);
+        if(in_array($command,['archive','purge','restore'],true))$this->finance->complete($order,$command,$request,$result);
         if ($order['nativeMissing'] ?? false) { return; }
         if ($command === 'block' && $order['status'] === 'active') { $this->api->order_suspend(['id'=>$id,'reason'=>$request['reason']]); }
         if ($command === 'unblock' && $order['status'] === 'suspended') { $this->api->order_unsuspend(['id'=>$id]); }
         $status = match($result['phase']) { 'blocked','archived' => 'suspended', 'deleted','cancelled' => 'canceled', default => 'active' };
         $this->api->order_update(['id'=>$id,'status'=>$status]);
     }
+    public function recoverNativeFinance(object $engine,bool $force): bool{return $this->finance->processNativeOne($engine,$force);}
 }

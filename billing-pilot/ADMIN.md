@@ -10,6 +10,44 @@ endpoint только с IP основного backend. Ответы имеют 
 совпадать в FOSS и основном backend, быть длиной не менее 32 символов и отличаться
 от owner token. Секреты не помещают в argv, URL, Git или логи.
 
+## Финансовый callback
+
+Перед archive/purge выполняется server-only prepare, после подтверждённого effect —
+complete. Archive замораживает consumption и auto, сохраняя остаток; restore prepare
+только резервирует resume lease, а complete с `ready/running` возобновляет остаток.
+Автопополнение после restore остаётся выключено. Purge и native cancel/delete
+завершают paid service, сохраняя деньги. Stop/block/suspend consumption не завершают.
+
+В приватном `.env` задают `ADMIN_FINANCE_URL` — полный HTTPS URL
+`/api/internal/billing/lifecycle` (HTTP допускается только loopback) — и отдельный
+`ADMIN_FINANCE_TOKEN`. `./billing prepare` создаёт `.secrets/admin-finance-token`,
+проверяет совпадение с `.env` и отличие от owner/admin bridge tokens. Пустой URL
+по умолчанию означает fail-closed для starting/destructive operations. Значение
+токена на main backend должно совпадать; ни URL с credentials, ни redirects не
+допускаются. Настройка передаётся billing и admin-worker через compose/update.yml.
+
+POST body содержит `{operationId,orderId,clientId,account,reference,command,stage,
+reason,actor}`; у complete также `effect:{phase,status}` из engine. Stage — prepare,
+complete либо check. Effect не входит в immutable request fingerprint. Main UI
+actor остаётся UUID/email; native actor — `{source:"FOSSBilling"}`. Для activate,
+start/unblock/owner_start применяется check. HTTP 409 — отказ policy, остальные
+ошибки/timeout — временная недоступность без raw upstream body в ответах/audit.
+
+Account/reference берутся только из exact orders/retired_orders + client mapping.
+Синтетический portal client с потерянным mapping блокируется; по нему нельзя
+объявить service бесплатным. Standalone native client передаётся с null tuple,
+а main проверяет отсутствие привязанного PG server.
+До финансового prepare проверяется engine identity/state и точный confirmVmid:
+ошибочное подтверждение purge не завершает paid service и не отправляет callback.
+
+Admin queue использует тот же operation UUID для prepare/engine/complete и после
+потерянного ответа. Native cancel/delete хранит immutable request в finance_native;
+его UUID определяется order/client/event/state и последним admin restore. Worker
+восстанавливает незавершённые effects/callbacks, включая удалённый native order.
+Before-delete hook выполняет prepare вне core forceDelete catch; adapter guard
+также защищает skipEvent. SQLite transaction не охватывает HTTP/SSH. Проверки
+используют отдельный loopback mock; тесты не обращаются к платёжному провайдеру.
+
 ## Контракт
 
 Каждый запрос содержит доверенный `actor: {account: UUID, email: string}`,
@@ -93,7 +131,8 @@ VMID. Account quota освобождается только после подт�
 
 Native FOSS cancel/delete сохраняет диск. При native order_delete owner видит
 cancelled и не восстанавливает VPS. Admin может archive, restore или purge такого
-orphan через тот же audit/marker contract; новый FOSS order не создаётся. Даже после
+orphan через тот же audit/marker contract, если main finance разрешает операцию;
+terminal paid cancel не возобновляется через restore. Новый FOSS order не создаётся. Даже после
 admin restore owner остаётся cancelled. Пропавшая либо чужая VM даёт missing с
 reason, не deleted; слот автоматически не освобождается и VM не клонируется.
 

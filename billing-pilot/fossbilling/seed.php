@@ -9,6 +9,8 @@ require 'load.php';
 $di['translate']();
 $di['loggedin_admin'] = $di['db']->getExistingModelById('Admin', 1);
 $api = $di['api_admin'];
+$api->extension_activate(['id'=>'safehostfinance','type'=>'mod']);
+if(!$api->hook_batch_connect(['mod'=>'safehostfinance']))throw new RuntimeException('Finance lifecycle hooks unavailable');
 function optionalSshKey($api, int $formId): void {
     foreach ($api->formbuilder_get_form_fields(['form_id' => $formId]) as $field) {
         if ($field['name'] !== 'ssh_key') { continue; }

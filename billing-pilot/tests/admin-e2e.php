@@ -20,6 +20,7 @@ function infraTest(): array { return json_decode(file_get_contents('http://mock:
 final class LoseAdminResponse {
     private bool $lose=true;
     public function __construct(private EngineGateway $engine) {}
+    public function state(int $client,int $order):array{return $this->engine->state($client,$order);}
     public function action(array $order,string $command,array $r): array {
         $result=$this->engine->action($order,$command,$r);
         if($this->lose){$this->lose=false;throw new RuntimeException('SECRET-RAW-TRANSPORT-FAILURE');}
@@ -69,7 +70,7 @@ verifyAdmin($dashboard['stats']['serversToday']>=1&&$dashboard['hosts'][0]['slot
 verifyAdmin(!str_contains(json_encode($dashboard),'api_token')&&!str_contains(json_encode($dashboard),'password'),'Dashboard leaks credentials');
 $owner=$di['db']->getExistingModelById('Client',$clientId);$clientApi=new \FOSSBilling\Api\Proxy($owner);$clientApi->setDi($di);
 $before=infraTest();
-foreach(['admin','Admin','archive','restore','purge','monitor','ownerPower','action'] as $method){
+foreach(['admin','Admin','archive','restore','purge','monitor','ownerPower','action','finance'] as $method){
     $denied=false;try{$clientApi->servicecustom_call(['order_id'=>$orderId,'method'=>$method,'admin'=>true,'command'=>'purge','confirm_vmid'=>$vmid]);}catch(Throwable $e){$denied=true;}
     verifyAdmin($denied,'Public customCall reached privileged method '.$method);
 }

@@ -136,6 +136,7 @@ class AdminEngineTests(unittest.TestCase):
             self.admin('purge', operation_id=operation, confirm_vmid=1100)
         self.assertNotIn(1100, self.pve.vms)
         self.assertEqual(self.admin('purge', operation_id=operation, confirm_vmid=1100)['phase'], 'deleted')
+        self.assertEqual(self.owner('cancel')['phase'], 'deleted')
         self.assertEqual(sum(c[0] == 'destroy' for c in self.pve.calls), 1)
         self.assertEqual(self.e.db.execute('SELECT COUNT(*) FROM credential').fetchone()[0], 0)
         self.assertFalse((Path(self.temp.name) / 'snippets/safehost-billing-1100.yaml').exists())
@@ -162,6 +163,21 @@ class AdminEngineTests(unittest.TestCase):
         self.assertEqual(self.pve.calls, before)
         with self.assertRaises(engine.Refused):
             self.admin('start', operation_id=operation)
+
+    def test_native_cancel_without_allocation_is_idempotent_without_pve_effects(self):
+        before = list(self.pve.calls)
+        result = self.e.handle({'action':'cancel','order_id':30,'client_id':2})
+        self.assertEqual(result, {'phase':'cancelled','status':'stopped'})
+        self.assertEqual(result, self.e.handle({'action':'cancel','order_id':30,'client_id':2}))
+        self.assertEqual(self.pve.calls, before)
+
+    def test_native_cancel_archived_vm_preserves_disk_and_archived_reservation(self):
+        self.admin('archive')
+        self.pve.states[1100] = 'running'
+        result = self.owner('cancel')
+        self.assertEqual((result['phase'], result['status']), ('archived', 'stopped'))
+        self.assertIn('scsi0', self.pve.vms[1100])
+        self.assertEqual(self.e.handle({'action':'monitor'})['hosts'][0]['memoryReservedBytes'], 0)
 
     def test_monitoring_keeps_unmanaged_capacity_and_releases_archived_reservation(self):
         password = self.owner('password')['password']

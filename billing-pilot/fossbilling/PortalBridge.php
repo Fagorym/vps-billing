@@ -178,6 +178,7 @@ final class FossPortal
     {
         $data = $this->get($id);
         if ((int) $data['client_id'] !== $client || $data['status'] !== 'active') { throw new DomainException('Owner operation unavailable'); }
+        if($start){require_once __DIR__.'/FinanceLifecycle.php';FinanceLifecycle::fromDi($this->di)->check($data,'owner_start');}
         require_once __DIR__ . '/EngineGateway.php';
         $result = (new EngineGateway())->ownerPower($client, $id, $start);
         $this->api->order_update(['id' => $id, 'status' => 'active']);

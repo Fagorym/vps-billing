@@ -6,6 +6,8 @@ services:
     environment:
       PORTAL_BRIDGE_TOKEN: ${PORTAL_BRIDGE_TOKEN:-}
       ADMIN_PORTAL_BRIDGE_TOKEN: ${ADMIN_PORTAL_BRIDGE_TOKEN:-}
+      ADMIN_FINANCE_URL: ${ADMIN_FINANCE_URL:-}
+      ADMIN_FINANCE_TOKEN: ${ADMIN_FINANCE_TOKEN:-}
     restart: unless-stopped
     ports:
       - "127.0.0.1:8088:80"
@@ -23,6 +25,11 @@ services:
       dockerfile: docker/Dockerfile
     entrypoint: [/usr/local/bin/php, /opt/pilot/admin-worker.php]
     user: "33:33"
+    environment:
+      PORTAL_BRIDGE_TOKEN: ${PORTAL_BRIDGE_TOKEN:-}
+      ADMIN_PORTAL_BRIDGE_TOKEN: ${ADMIN_PORTAL_BRIDGE_TOKEN:-}
+      ADMIN_FINANCE_URL: ${ADMIN_FINANCE_URL:-}
+      ADMIN_FINANCE_TOKEN: ${ADMIN_FINANCE_TOKEN:-}
     restart: unless-stopped
     volumes:
       - billing:/var/www/html

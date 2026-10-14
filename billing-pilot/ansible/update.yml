@@ -72,7 +72,19 @@
         line: "ADMIN_PORTAL_BRIDGE_TOKEN={{ lookup('file', admin_portal_token_file | default(billing_root + '/.secrets/admin-portal-token')) | trim }}"
         mode: '0600'
       no_log: true
-    - name: Пересобрать только приложение биллинга
+    - name: Передать отдельный секрет и URL финансового callback
+      ansible.builtin.lineinfile:
+        path: /opt/billing-pilot/.env
+        regexp: '^{{ item.key }}='
+        line: '{{ item.key }}={{ item.value }}'
+        mode: '0600'
+      loop:
+        - key: ADMIN_FINANCE_TOKEN
+          value: "{{ lookup('file', admin_finance_token_file | default(billing_root + '/.secrets/admin-finance-token')) | trim }}"
+        - key: ADMIN_FINANCE_URL
+          value: "{{ admin_finance_url | default('') }}"
+      no_log: true
+    - name: Обновить окружение финансовой интеграции приложения
       ansible.builtin.command: "{{ compose }} up -d --build --wait billing"
       async: 1800
       poll: 10

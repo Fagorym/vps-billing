@@ -2,6 +2,8 @@
 declare(strict_types=1);
 if (PHP_SAPI !== 'cli') { exit(1); }
 $root = '/var/www/html';
+$module=$root.'/modules/Safehostfinance';if(!is_dir($module))mkdir($module,0755,true);
+foreach(['Service.php','manifest.json']as$file){copy('/opt/pilot/Safehostfinance/'.$file,$module.'/'.$file);chmod($module.'/'.$file,0644);}
 $path = $root . '/.htaccess';
 $text = file_get_contents($path);
 foreach (['portal.php', 'admin-portal.php'] as $endpoint) {

@@ -80,6 +80,22 @@ def prepare():
         raise ValueError('Admin token должен совпадать с .env и отличаться от owner token')
     if admin_configured is None:
         env.write_text(text.rstrip() + '\nADMIN_PORTAL_BRIDGE_TOKEN=' + admin_token + '\n')
+    finance_file = ROOT / '.secrets/admin-finance-token'
+    if finance_file.is_symlink():
+        raise ValueError('Finance token не должен быть symlink')
+    text = env.read_text()
+    finance_configured = next((line.split('=', 1)[1] for line in text.splitlines() if line.startswith('ADMIN_FINANCE_TOKEN=')), None)
+    if not finance_file.exists():
+        finance_file.write_text((finance_configured or secrets.token_hex(32)) + '\n')
+    finance_file.chmod(0o600)
+    finance_token = finance_file.read_text().strip()
+    if len(finance_token) < 32 or finance_token in (token, admin_token) or finance_configured is not None and finance_configured != finance_token:
+        raise ValueError('Finance token должен совпадать с .env и отличаться от owner/admin token')
+    if finance_configured is None:
+        text = text.rstrip() + '\nADMIN_FINANCE_TOKEN=' + finance_token + '\n'
+    if not any(line.startswith('ADMIN_FINANCE_URL=') for line in text.splitlines()):
+        text = text.rstrip() + '\nADMIN_FINANCE_URL=\n'
+    env.write_text(text)
     credentials.chmod(0o600)
     env.chmod(0o600)
     for key in (ROOT / '.secrets/admin_ed25519', ROOT / '.secrets/transport/id_ed25519'):
@@ -173,7 +189,8 @@ def public_up():
 def remote_update():
     variables = {'billing_root': str(ROOT), 'pilot_host_key': str(PILOT / '.secrets/host_ed25519'),
                  'pilot_guest_key': str(ROOT / '.secrets/admin_ed25519'),
-                 'pilot_known_hosts': str(PILOT / '.state/known_hosts')}
+                 'pilot_known_hosts': str(PILOT / '.state/known_hosts'),
+                 'admin_finance_url': next((line.split('=', 1)[1] for line in (ROOT / '.env').read_text().splitlines() if line.startswith('ADMIN_FINANCE_URL=')), '')}
     execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml', ROOT / 'ansible/update.yml',
              '-e', json.dumps(variables)], cwd=ROOT, env=ansible_env())
     print('Приложение обновлено: https://80.249.131.4/admin . Действующие VPS сохранены.', flush=True)
@@ -235,8 +252,10 @@ def main():
         if args.action == 'test':
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/portal-unit.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/admin-unit.php', demo=True)
+            compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/finance-unit.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/e2e.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/admin-e2e.php', demo=True)
+            compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/finance-e2e.php', demo=True)
             compose('down', '-v', demo=True)
             print('Тестовый проект и его временные volumes удалены. Данные demo и сервера сохранены.', flush=True)
             return

@@ -564,7 +564,11 @@ class Engine:
         row = self.db.execute('SELECT * FROM allocation WHERE order_id=?', (order,)).fetchone()
         if row is None:
             row = self.db.execute('SELECT * FROM retired_allocation WHERE order_id=?', (order,)).fetchone()
+        if action == 'cancel' and row is None:
+            return {'phase': 'cancelled', 'status': 'stopped'}
         require(row is not None and row['client_id'] == client, 'VPS этого клиента не найден')
+        if action == 'cancel' and row['phase'] == 'deleted':
+            return self.info(row)
         if action in ('status', 'readiness'):
             info = self.info(row)
             if action == 'readiness':
@@ -577,6 +581,8 @@ class Engine:
         self.owned_config(row)
         if action == 'password':
             return self.initial_password(row)
+        if action == 'cancel' and row['phase'] in ('archived', 'archiving'):
+            return self.power(row, False, 'archived')
         if action in ('owner_start', 'owner_stop'):
             require(row['phase'] in ('ready', 'stopped'), 'VPS заблокирован, архивирован или удалён')
             require(not self.db.execute('SELECT 1 FROM admin_operation WHERE order_id=? AND state=?', (order, 'pending')).fetchone(),
