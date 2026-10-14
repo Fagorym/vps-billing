@@ -242,7 +242,7 @@
 
     - name: Установить адаптер в persistent volume
       ansible.builtin.command:
-        argv: [docker, compose, -p, safehost-billing, exec, -T, billing, sh, -ec, 'mkdir -p /var/www/html/library/Plugin/SafehostProxmox /var/www/html/modules/Servicecustom/templates/client; cp /opt/pilot/SafehostProxmox.php /var/www/html/library/Plugin/SafehostProxmox/; cp /opt/pilot/mod_servicecustom_manage.html.twig /var/www/html/modules/Servicecustom/templates/client/; chown -R www-data:www-data /var/www/html/library/Plugin/SafehostProxmox /var/www/html/modules/Servicecustom/templates/client /var/www/html/data']
+        argv: [docker, compose, -p, safehost-billing, exec, -T, billing, sh, -ec, 'mkdir -p /var/www/html/library/Plugin/SafehostProxmox /var/www/html/modules/Servicecustom/templates/client; php /opt/pilot/install-portal.php; cp /opt/pilot/SafehostProxmox.php /var/www/html/library/Plugin/SafehostProxmox/; cp /opt/pilot/mod_servicecustom_manage.html.twig /var/www/html/modules/Servicecustom/templates/client/; chown -R www-data:www-data /var/www/html/library/Plugin/SafehostProxmox /var/www/html/modules/Servicecustom/templates/client /var/www/html/data']
       args:
         chdir: /opt/billing-pilot
 
@@ -255,3 +255,8 @@
       ansible.builtin.uri:
         url: http://127.0.0.1:8088/
         status_code: 200
+
+    - name: Запустить изолированный обработчик административных операций
+      ansible.builtin.command: docker compose -p safehost-billing up -d --build admin-worker
+      args:
+        chdir: /opt/billing-pilot

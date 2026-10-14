@@ -9,6 +9,7 @@ class SafehostProxmox
     public function activate(array $data, array $order, array $params = []): bool
     {
         $this->assertLifecycle($params);
+        $this->finance()->check($order,'activate');
         $this->request('create', $order, [
             'plan' => $this->config['plan'] ?? '',
             'ssh_key' => $data['ssh_key'] ?? '',
@@ -26,6 +27,7 @@ class SafehostProxmox
     public function unsuspend(array $data, array $order, array $params = []): bool
     {
         $this->assertLifecycle($params);
+        $this->finance()->check($order,'unblock');
         $this->request('unsuspend', $order);
         return true;
     }
@@ -33,14 +35,15 @@ class SafehostProxmox
     public function cancel(array $data, array $order, array $params = []): bool
     {
         $this->assertLifecycle($params);
-        $this->request('cancel', $order);
+        $this->finance()->native($order,'cancel',fn()=>$this->request('cancel',$order));
         return true;
     }
 
     public function delete(array $data, array $order, array $params = []): bool
     {
         $this->assertLifecycle($params);
-        return $this->cancel($data, $order); // No qm destroy: disk and allocation remain.
+        $this->finance()->native($order,'delete',fn()=>$this->request('cancel',$order));
+        return true; // No qm destroy: disk and allocation remain.
     }
 
     public function renew(array $data, array $order, array $params = []): bool
@@ -84,6 +87,10 @@ class SafehostProxmox
         if ($params !== []) {
             throw new \FOSSBilling\InformationException('Операция доступна только обработчику заказа, не через Custom call.');
         }
+    }
+    private function finance(): FinanceLifecycle
+    {
+        require_once '/opt/pilot/FinanceLifecycle.php';return FinanceLifecycle::runtime();
     }
 
     private function request(string $action, array $order, array $extra = []): array

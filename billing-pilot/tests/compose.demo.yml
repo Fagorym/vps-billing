@@ -2,6 +2,9 @@ services:
   billing:
     environment:
       PORTAL_BRIDGE_TOKEN: test-token-with-at-least-thirty-two-characters
+      ADMIN_PORTAL_BRIDGE_TOKEN: separate-admin-token-with-at-least-thirty-two-characters
+      ADMIN_FINANCE_URL: http://127.0.0.1:8091/api/internal/billing/lifecycle
+      ADMIN_FINANCE_TOKEN: test-finance-token-separate-and-at-least-thirty-two-characters
     volumes:
       - ./tests:/tests:ro
       - ./tests/ssh-demo.php:/usr/bin/ssh:ro
@@ -19,5 +22,18 @@ services:
       - ./config.json:/config.json:ro
       - mock:/state
     networks: [billing]
+  finance:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile.mock
+    command: [/usr/bin/python3, /tests/finance-server.py]
+    network_mode: service:billing
+    volumes:
+      - ./tests:/tests:ro
+    healthcheck:
+      test: [CMD, /usr/bin/python3, -c, 'from urllib.request import urlopen; urlopen("http://127.0.0.1:8091/health",timeout=1)']
+      interval: 1s
+      timeout: 2s
+      retries: 30
 volumes:
   mock:
