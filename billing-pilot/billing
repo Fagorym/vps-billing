@@ -177,23 +177,26 @@ def remote_up():
 
 def public_up():
     config = json.loads((ROOT / 'config.json').read_text())
-    if config['public_ip'] != '80.249.131.4':
-        raise ValueError('Публичный доступ этого пилота закреплён за 80.249.131.4')
-    variables = {'billing_root': str(ROOT), 'pilot_host_key': str(PILOT / '.secrets/host_ed25519'),
+    import re
+    host = os.environ.get('BILLING_PUBLIC_HOST', config['public_ip'])
+    if not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?', host) or len(host)>253:
+        raise ValueError('Некорректный публичный hostname')
+    variables = {'engine': config, 'ansible_host': config['public_ip'], 'billing_public_host': host, 'billing_root': str(ROOT), 'pilot_host_key': str(PILOT / '.secrets/host_ed25519'),
                  'pilot_guest_key': str(ROOT / '.secrets/admin_ed25519'),
                  'pilot_known_hosts': str(PILOT / '.state/known_hosts')}
     execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml', ROOT / 'ansible/public.yml',
              '-e', json.dumps(variables)], cwd=ROOT, env=ansible_env())
-    print('Публичная панель: https://80.249.131.4/admin . SSH-туннель не нужен.', flush=True)
+    print('Публичная панель: https://' + host + '/admin .', flush=True)
 
 def remote_update():
-    variables = {'billing_root': str(ROOT), 'pilot_host_key': str(PILOT / '.secrets/host_ed25519'),
+    config = json.loads((ROOT / 'config.json').read_text())
+    variables = {'engine': config, 'ansible_host': config['public_ip'], 'billing_root': str(ROOT), 'pilot_host_key': str(PILOT / '.secrets/host_ed25519'),
                  'pilot_guest_key': str(ROOT / '.secrets/admin_ed25519'),
                  'pilot_known_hosts': str(PILOT / '.state/known_hosts'),
                  'admin_finance_url': next((line.split('=', 1)[1] for line in (ROOT / '.env').read_text().splitlines() if line.startswith('ADMIN_FINANCE_URL=')), '')}
     execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml', ROOT / 'ansible/update.yml',
              '-e', json.dumps(variables)], cwd=ROOT, env=ansible_env())
-    print('Приложение обновлено: https://80.249.131.4/admin . Действующие VPS сохранены.', flush=True)
+    print('Приложение обновлено. Действующие VPS сохранены.', flush=True)
 
 def expand_pool():
     import ipaddress
@@ -213,7 +216,9 @@ def expand_pool():
 def main():
     global PROJECT, CHECK
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=('prepare', 'demo', 'test', 'up', 'publish', 'update', 'expand', 'open'))
+    parser.add_argument('action', choices=('prepare', 'demo', 'test', 'up', 'publish', 'update', 'expand', 'open', 'network-prepare'))
+    parser.add_argument('--candidate')
+    parser.add_argument('--network-ready', action='store_true')
     args = parser.parse_args()
     bootstrap()
     sys.path.insert(0, str(PILOT))
@@ -228,12 +233,26 @@ def main():
         remote_update()
     elif args.action == 'expand':
         expand_pool()
+    elif args.action == 'network-prepare':
+        if not args.candidate or not args.network_ready:
+            raise ValueError('Нужны --candidate и --network-ready после перехода uplink; см. PUBLIC-IPV4.md')
+        config = json.loads(Path(args.candidate).read_text())
+        import ipaddress
+        nat = [{'ip':'10.10.10.11','port':2223}] + [{'ip':str(ipaddress.IPv4Address(config['ip_first'])+slot),'port':config['ssh_port_first']+slot} for slot in range(config['slots'])]
+        variables = {'engine': config, 'billing_nat': nat, 'ansible_host': config['public_ip'], 'public_network_ready_ack': True,
+                     'billing_root': str(ROOT), 'pilot_host_key': str(PILOT / '.secrets/host_ed25519'),
+                     'pilot_known_hosts': str(PILOT / '.state/known_hosts')}
+        execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml', ROOT / 'ansible/public-network.yml',
+                 '-e', json.dumps(variables)], cwd=ROOT, env=ansible_env())
+        staged = ROOT / 'config.json.tmp'
+        staged.write_text(json.dumps(config, indent=2) + '\n'); staged.replace(ROOT / 'config.json')
+        print('Конфигурация и boot guards подготовлены. Проверьте NAT, TLS, canary; флаг сайта включается отдельно.')
     elif args.action == 'open':
         print('Панель: http://127.0.0.1:8088/ . Туннель работает, пока эта команда запущена.', flush=True)
         execute(['ssh', '-N', '-i', ROOT / '.secrets/admin_ed25519', '-p', '2223',
                  '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
                  '-o', 'UserKnownHostsFile=' + str(PILOT / '.state/known_hosts'), '-o', 'ExitOnForwardFailure=yes',
-                 '-L', '127.0.0.1:8088:127.0.0.1:8088', 'vpsadmin@80.249.131.4'])
+                 '-L', '127.0.0.1:8088:127.0.0.1:8088', 'vpsadmin@' + json.loads((ROOT / 'config.json').read_text())['public_ip']])
     else:
         if args.action == 'test':
             CHECK = True
@@ -248,14 +267,18 @@ def main():
                      ROOT / 'ansible/update.yml', '--syntax-check'], cwd=ROOT, env=ansible_env())
             execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml',
                      ROOT / 'ansible/expand.yml', '--syntax-check'], cwd=ROOT, env=ansible_env())
+            for play in ('public.yml','public-network.yml'):
+                execute([PILOT / '.venv/bin/ansible-playbook', '-i', PILOT / 'inventory.yml', ROOT / 'ansible' / play, '--syntax-check'], cwd=ROOT, env=ansible_env())
         install_local()
         if args.action == 'test':
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/portal-unit.php', demo=True)
+            compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/public-portal-unit.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/admin-unit.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/finance-unit.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/e2e.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/admin-e2e.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/finance-e2e.php', demo=True)
+            compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/public-e2e.php', demo=True)
             compose('down', '-v', demo=True)
             print('Тестовый проект и его временные volumes удалены. Данные demo и сервера сохранены.', flush=True)
             return

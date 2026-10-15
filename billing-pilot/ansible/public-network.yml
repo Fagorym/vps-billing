@@ -1,0 +1,107 @@
+---
+- name: Подготовить публичный пул на уже переключённом uplink
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    ansible_ssh_private_key_file: "{{ pilot_host_key }}"
+    ansible_ssh_common_args: "-o UserKnownHostsFile={{ pilot_known_hosts | quote }} -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+  tasks:
+    - name: Потребовать параметры реального пула и подтверждённый переход сети
+      ansible.builtin.assert:
+        that:
+          - public_network_ready_ack | default(false) | bool
+          - engine.public_network is defined
+          - engine.public_network.host_ip == engine.public_ip
+        fail_msg: Сначала согласуйте подсеть, стоимость и окно; переключите uplink через KVM и проверьте новый management IP.
+    - name: Прочитать текущие IPv4 интерфейсов без изменений
+      ansible.builtin.command: ip -json -4 address show
+      register: host_addresses
+      changed_when: false
+    - name: Убедиться, что новый IP действительно назначен хосту
+      ansible.builtin.assert:
+        that: "engine.public_ip in ((host_addresses.stdout | from_json) | map(attribute='addr_info') | flatten | map(attribute='local') | list)"
+    - name: Прочитать управляемый NAT перед заменой
+      ansible.builtin.slurp:
+        src: /usr/local/sbin/safehost-billing-nat
+      register: existing_nat
+    - name: Отказаться менять чужой NAT
+      ansible.builtin.assert:
+        that:
+          - "'# managed-by: safehost-billing:v1' in (existing_nat.content | b64decode)"
+          - billing_nat is defined
+    - name: Установить nftables
+      ansible.builtin.apt:
+        name: nftables
+        state: present
+    - name: Передать миграцию и сетевые модули
+      ansible.builtin.copy:
+        src: "{{ billing_root }}/backend/{{ item }}"
+        dest: "/usr/local/lib/safehost-billing/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: [engine.py, ipam.py, guest_network.py, network_boot.py, network_migrate.py, expand_pool.py]
+    - name: Сохранить кандидат конфигурации
+      ansible.builtin.copy:
+        content: "{{ engine | to_nice_json }}\n"
+        dest: /etc/safehost-billing/network-candidate.json
+        mode: '0600'
+    - name: Проверить миграцию без изменения конфигурации
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, /usr/local/lib/safehost-billing/network_migrate.py, --candidate, /etc/safehost-billing/network-candidate.json]
+      changed_when: false
+    - name: Применить проверенную миграцию sealed-конфигурации
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, /usr/local/lib/safehost-billing/network_migrate.py, --candidate, /etc/safehost-billing/network-candidate.json, --apply]
+    - name: Инициализировать и проверить IPv4 таблицы
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, /usr/local/lib/safehost-billing/engine.py]
+        stdin: '{"action":"network_capacity"}'
+      changed_when: false
+    - name: Сохранить NAT с новым адресом и прежними портами
+      ansible.builtin.template:
+        src: nat.sh.j2
+        dest: /usr/local/sbin/safehost-billing-nat
+        mode: '0750'
+        validate: /bin/sh -n %s
+    - name: Переприменить только управляемые NAT-цепочки
+      ansible.builtin.systemd_service:
+        name: safehost-billing-nat.service
+        state: restarted
+    - name: Сохранить boot prerequisite
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/safehost-public-networks.service
+        mode: '0644'
+        content: |
+          # managed-by: safehost-public-ipv4:v1
+          [Unit]
+          Description=Restore Safehost tenant network guards before VM autostart
+          After=pve-cluster.service network-online.target
+          Requires=pve-cluster.service
+          Before=pve-guests.service
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/bin/python3 /usr/local/lib/safehost-billing/network_boot.py
+          [Install]
+          WantedBy=multi-user.target
+    - name: Создать каталог зависимости Proxmox guests
+      ansible.builtin.file:
+        path: /etc/systemd/system/pve-guests.service.d
+        state: directory
+        mode: '0755'
+    - name: Запретить автозапуск guests без сетевых guards
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/pve-guests.service.d/90-safehost-public-network.conf
+        mode: '0644'
+        content: |
+          # managed-by: safehost-public-ipv4:v1
+          [Unit]
+          Requires=safehost-public-networks.service
+          After=safehost-public-networks.service
+    - name: Проверить и включить guards без перезапуска VM
+      ansible.builtin.systemd_service:
+        name: safehost-public-networks.service
+        daemon_reload: true
+        enabled: true
+        state: restarted

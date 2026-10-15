@@ -24,6 +24,11 @@ final class EngineGateway
         if (!is_array($reply['result'] ?? null)) { throw new RuntimeException('Invalid engine response'); }
         return $reply['result'];
     }
+    public function network(array $payload): array
+    {
+        if(!in_array($payload['action']??'', ['network_capacity','network_reserve','network_payment_pending','network_release_hold'],true))throw new InvalidArgumentException('Invalid network action');
+        return $this->request($payload);
+    }
     public function monitoring(): array { return $this->request(['action' => 'monitor']); }
     public function state(int $client,int $order): array
     {

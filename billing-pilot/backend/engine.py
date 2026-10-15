@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 import uuid
 
 from cryptography.fernet import Fernet, InvalidToken
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ipam import Ipam, Refused as IpamRefused
 
 
 class Refused(ValueError):
@@ -126,6 +128,25 @@ class Proxmox:
         except (OSError, ValueError, subprocess.TimeoutExpired):
             return False
 
+    def network_guard(self, row, lease, config):
+        from guest_network import install_guard
+        install_guard(row, lease, config)
+
+    def remove_network_guard(self, vmid):
+        from guest_network import remove_guard
+        remove_guard(vmid)
+
+    def apply_public_network(self, row, lease, config):
+        from guest_network import apply_guest
+        apply_guest(row, lease, config)
+
+    def public_ready(self, ip):
+        try:
+            with socket.create_connection((ip, 22), timeout=2) as connection:
+                return connection.recv(128).startswith(b'SSH-2.0-')
+        except OSError:
+            return False
+
     def guest_fs(self, vmid):
         try:
             result = subprocess.run(['/usr/sbin/qm', 'guest', 'cmd', str(vmid), 'get-fsinfo'],
@@ -176,6 +197,7 @@ class Engine:
         else:
             require(not self.db.execute('SELECT 1 FROM allocation').fetchone(), 'Потерян config.sha256')
             config_hash.write_text(digest + '\n')
+        self.ipam = Ipam(self.db, config.get("public_network"))
 
     def marker(self, row):
         return f'safehost-billing:v1:order:{row["order_id"]}:client:{row["client_id"]}:' + fingerprint(json.loads(row['spec']))
@@ -193,14 +215,29 @@ class Engine:
                 'VMID занят чужой VM или изменена метка владельца')
         require(not cfg.get('lock'), 'VM заблокирована; повторите после завершения задачи')
         require('bridge=' + self.c['bridge'] in cfg.get('net0', '').split(','), 'Изменилась сеть VM')
-        require(not any(re.fullmatch(r'net[1-9]\d*', k) for k in cfg), 'У VM появилась дополнительная сеть')
+        stored = self.db.execute('SELECT phase FROM allocation WHERE order_id=?', (row['order_id'],)).fetchone()
+        effective_phase = stored['phase'] if stored else row['phase']
+        public = json.loads(row['spec']).get('network_mode') == 'public_ipv4'
+        extra_nets = {k for k in cfg if re.fullmatch(r'net[1-9]\d*', k)}
+        require(extra_nets <= ({'net1'} if public else set()), 'У VM появилась дополнительная сеть')
+        if public and row['phase'] != 'reserved':
+            lease = self.ipam.for_order(row['order_id'], row['client_id'])
+            detached = effective_phase in ('archiving', 'purging', 'canceling', 'restoring') and 'net1' not in cfg and 'ipconfig1' not in cfg
+            if lease and not detached:
+                require(cfg.get('net1') == self.public_nic(row, lease, down=True) or cfg.get('net1') == self.public_nic(row, lease), 'Изменилась публичная сеть VM')
+                expected = f'ip={lease["address"]}/{self.public_prefix()},gw={self.c["public_network"]["gateway"]}'
+                require(cfg.get('ipconfig1') == expected, 'Изменилась публичная адресация VM')
+            elif not lease:
+                require(not extra_nets and not cfg.get('ipconfig1'), 'Освобождённый адрес остался у VM')
+            require(cfg.get('net0') == self.private_nic(row), 'Изменилась приватная сеть VM')
         require(not cfg.get('hookscript'), 'У VM появился сторонний lifecycle hook')
         require(not any(re.fullmatch(r'(?:unused|tpmstate)\d+', k) for k in cfg), 'У VM появились неучтённые тома')
         if row['phase'] != 'reserved':
             ip = str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])
             fields = dict(part.split('=', 1) for part in cfg.get('ipconfig0', '').split(',') if '=' in part)
-            require(fields == {'ip': ip + '/24', 'gw': self.c['gateway']}, 'Изменилась адресация VM')
-            require(not any(re.fullmatch(r'ipconfig[1-9]\d*', k) for k in cfg), 'У VM появилась дополнительная адресация')
+            expected_private = {'ip': ip + '/24'} if public else {'ip': ip + '/24', 'gw': self.c['gateway']}
+            require(fields == expected_private, 'Изменилась адресация VM')
+            require(not any(re.fullmatch(r'ipconfig[1-9]\d*', k) and (not public or k != 'ipconfig1') for k in cfg), 'У VM появилась дополнительная адресация')
         for disk in ('scsi0', 'efidisk0', 'ide2'):
             if disk in cfg:
                 require(re.fullmatch(re.escape(self.c['storage']) + ':vm-' + str(vmid) + r'-[a-z0-9-]+',
@@ -208,6 +245,56 @@ class Engine:
         require(not any(re.fullmatch(r'(?:scsi|sata|virtio|ide)\d+', k) and k not in ('scsi0', 'ide2')
                         for k in cfg), 'У VM появились дополнительные диски')
         return cfg
+
+    def public_prefix(self):
+        return ipaddress.IPv4Network(self.c['public_network']['cidr']).prefixlen
+
+    def mac(self, row, nic):
+        blob = uuid.uuid5(uuid.NAMESPACE_OID, f'safehost:{row["order_id"]}:{row["client_id"]}:{nic}').bytes
+        return ':'.join(f'{x:02x}' for x in b'\x02' + blob[:5])
+
+    def private_nic(self, row):
+        return f'virtio={self.mac(row, 0)},bridge={self.c["bridge"]},firewall=0'
+
+    def public_nic(self, row, lease, down=False):
+        return f'virtio={self.mac(row, 1)},bridge={self.c["public_network"]["bridge"]},firewall=0' + (',link_down=1' if down else '')
+
+    def isolate_public(self, row):
+        lease = self.ipam.for_order(row['order_id'], row['client_id'])
+        if not lease:
+            return
+        require(self.pve.status(self.vmid(row)) == 'stopped', 'Нужно подтверждённо остановить VM')
+        cfg = self.pve.config(self.vmid(row))
+        if 'net1' in cfg or 'ipconfig1' in cfg:
+            self.pve.command('set', self.vmid(row), '--delete', 'net1,ipconfig1')
+        cfg = self.pve.config(self.vmid(row))
+        require('net1' not in cfg and 'ipconfig1' not in cfg and self.pve.status(self.vmid(row)) == 'stopped', 'Не удалось изолировать публичный адрес')
+        self.pve.network_guard(row, {**lease, 'state': 'released'}, self.c)
+        self.ipam.release_assigned(row['order_id'], row['client_id'], lease['id'], isolated=True)
+
+    def restore_public(self, row):
+        spec = json.loads(row['spec'])
+        vmid = self.vmid(row)
+        try:
+            lease = self.ipam.reserve(spec['account'], spec['reference'], declared_ips(self.pve, self.c['node'], exclude=vmid))
+            lease = self.ipam.bind(spec['account'], spec['reference'], lease['id'], row['order_id'], row['client_id'])
+            self.pve.command('set', vmid, '--net1', self.public_nic(row, lease, down=True),
+                             '--ipconfig1', f'ip={lease["address"]}/{self.public_prefix()},gw={self.c["public_network"]["gateway"]}')
+            self.pve.network_guard(row, lease, self.c)
+            if self.pve.status(vmid) != 'running':
+                self.pve.command('start', vmid)
+            self.pve.apply_public_network(row, lease, self.c)
+            self.pve.command('set', vmid, '--net1', self.public_nic(row, lease))
+            require(self.pve.ready(vmid, str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])) and self.pve.public_ready(lease['address']), 'Сеть восстанавливаемой VM ещё не готова')
+            self.pve.command('set', vmid, '--onboot', '1')
+            self.phase(row, 'ready')
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            # Retain the lease if stopping/detaching itself fails; a retry must
+            # verify isolation before returning any address to the pool.
+            self.stop_vm(row)
+            self.isolate_public(row)
+            self.phase(row, 'archived')
+            raise OSError('Восстановление сети отложено; VM сохранена в архиве') from error
 
     def reserve(self, order, client, spec):
         require(not self.db.execute('SELECT 1 FROM retired_allocation WHERE order_id=?', (order,)).fetchone(),
@@ -261,6 +348,9 @@ class Engine:
         require(json.loads(row['spec'])['ssh_key'] is None, 'Этот VPS использует SSH-ключ')
         ip = str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])
         require(self.pve.ready(self.vmid(row), ip), 'SSH ещё не готов; повторите запрос')
+        if json.loads(row['spec']).get('network_mode') == 'public_ipv4':
+            lease = self.ipam.for_order(row['order_id'], row['client_id'])
+            require(lease and self.pve.public_ready(lease['address']), 'Публичный SSH ещё не готов')
         credential = self.db.execute('SELECT encrypted FROM credential WHERE order_id=?', (row['order_id'],)).fetchone()
         require(credential is not None, 'Не найден начальный пароль; нужна проверка администратором')
         try:
@@ -317,6 +407,9 @@ class Engine:
     def power(self, row, start, phase=None):
         self.owned_config(row)
         if start:
+            lease = self.ipam.for_order(row['order_id'], row['client_id'])
+            if lease:
+                self.pve.network_guard(row, lease, self.c)
             self.pve.command('set', self.vmid(row), '--onboot', '1')
             if self.pve.status(self.vmid(row)) != 'running':
                 self.pve.command('start', self.vmid(row))
@@ -378,6 +471,12 @@ class Engine:
                 self.pve.command('destroy', self.vmid(row), '--purge', '1')
             else:
                 require(phase == 'purging', 'VM исчезла; автоматическое удаление неизвестных дисков запрещено')
+            lease = self.ipam.for_order(row['order_id'], row['client_id'])
+            if lease:
+                require(self.vmid(row) not in self.pve.guests(), 'Физическое удаление VM не подтверждено')
+                self.ipam.release_assigned(row['order_id'], row['client_id'], lease['id'], isolated=True)
+            if json.loads(row['spec']).get('network_mode') == 'public_ipv4':
+                self.pve.remove_network_guard(self.vmid(row))
             # The slot cannot be reused until this atomic retirement and credential cleanup.
             (self.snippets / f'safehost-billing-{self.vmid(row)}.yaml').unlink(missing_ok=True)
             with self.db:
@@ -402,12 +501,19 @@ class Engine:
             require(phase in ('ready', 'stopped', 'blocked', 'suspended', 'cancelled', 'archived', 'archiving'),
                     'Создание не завершено')
             self.phase(row, 'archiving')
-            result = self.power(row, False, 'archived')
+            self.stop_vm(row)
+            self.isolate_public(row)
+            self.phase(row, 'archived')
+            result = self.info(row)
         else:
             require(phase in ('archived', 'restoring'), 'Восстановление доступно только из архива')
             self.capacity(self.c['plans'][json.loads(row['spec'])['plan']], restoring=row)
             self.phase(row, 'restoring')
-            result = self.power(row, True)
+            if json.loads(row['spec']).get('network_mode') == 'public_ipv4':
+                self.restore_public(row)
+                result = self.info(row)
+            else:
+                result = self.power(row, True)
         self.db.execute('UPDATE allocation SET reason=? WHERE order_id=?', (request['reason'].strip(), row['order_id']))
         self.db.commit()
         return self.info(row)
@@ -416,6 +522,14 @@ class Engine:
         require(row['phase'] != 'cancelled', 'Заказ отменён; диск сохранён, новая активация запрещена')
         require(row['phase'] in ('reserved', 'configured', 'ready'), 'Повторная активация запрещена состоянием VPS')
         vmid, spec = self.vmid(row), json.loads(row['spec'])
+        lease = None
+        if spec.get('network_mode') == 'public_ipv4':
+            # Bind before cloning. An expired or forged reservation cannot create a VM.
+            lease = self.ipam.for_order(row['order_id'], row['client_id'])
+            if not lease:
+                lease = self.ipam.bind(spec['account'], spec['reference'], spec['lease_id'], row['order_id'], row['client_id'])
+        if lease:
+            require(lease['address'] not in declared_ips(self.pve, self.c['node'], exclude=vmid), 'Публичный IP занят сторонней VM')
         plan = self.c['plans'][spec['plan']]
         if vmid not in self.pve.guests():
             require(row['phase'] == 'reserved', 'Ранее созданная VM исчезла; автоматическое восстановление запрещено')
@@ -463,8 +577,12 @@ class Engine:
         self.pve.command('set', vmid, '--cores', plan['cores'], '--memory', plan['memory_mb'],
                          '--cpu', 'host', '--sockets', '1', '--onboot', '1', '--protection', '1',
                          '--ciuser', 'vpsadmin', '--ciupgrade', '0', '--nameserver', self.c['dns'],
-                         '--ipconfig0', f'ip={ip}/24,gw={self.c["gateway"]}',
+                         '--ipconfig0', f'ip={ip}/24' + ('' if lease else f',gw={self.c["gateway"]}'),
                          '--cicustom', 'user=local:snippets/' + snippet)
+        if lease:
+            self.pve.command('set', vmid, '--net0', self.private_nic(row), '--net1', self.public_nic(row, lease),
+                             '--ipconfig1', f'ip={lease["address"]}/{self.public_prefix()},gw={self.c["public_network"]["gateway"]}')
+            self.pve.network_guard(row, lease, self.c)
         size = re.search(r'(?:^|,)size=([0-9.]+)([GMT])(?:,|$)', cfg['scsi0'])
         require(size, 'Не удалось прочитать размер диска')
         gb = float(size[1]) * {'M': 1/1024, 'G': 1, 'T': 1024}[size[2]]
@@ -496,12 +614,19 @@ class Engine:
             current = 'blocked'
         elif current == 'ready' and status == 'stopped':
             current = 'stopped'
-        return {'vmid': self.vmid(row), 'public_ip': self.c['public_ip'],
+        public = json.loads(row['spec']).get('network_mode') == 'public_ipv4'
+        lease = self.ipam.for_order(row['order_id'], row['client_id']) if public else None
+        endpoint = ownership == 'owned' and current not in ('archived', 'archiving', 'deleted', 'cancelled', 'missing')
+        host = lease['address'] if public and lease and endpoint else None if public else self.c['public_ip']
+        port = 22 if public and host else 0 if public else self.c['ssh_port_first'] + row['slot']
+        return {'network_mode': 'public_ipv4' if public else 'nat', 'lease_id': lease['id'] if lease else None,
+                'lease_generation': lease['generation'] if lease else None,
+                'vmid': self.vmid(row), 'public_ip': host,
                 'private_ip': str(ipaddress.ip_address(self.c['ip_first']) + row['slot']),
-                'ssh_port': self.c['ssh_port_first'] + row['slot'], 'user': 'vpsadmin',
+                'ssh_port': port, 'user': 'vpsadmin',
                 'auth_mode': 'password' if json.loads(row['spec'])['ssh_key'] is None else 'key',
                 'phase': current, 'status': status, 'reason': reason, 'ownership': ownership,
-                'ssh': f'ssh -p {self.c["ssh_port_first"] + row["slot"]} vpsadmin@{self.c["public_ip"]}'}
+                'ssh': f'ssh -p {port} vpsadmin@{host}' if host and endpoint else None}
 
     def monitor(self):
         guests = self.pve.guests()
@@ -536,13 +661,26 @@ class Engine:
                 'memoryReservedBytes': sum(int(v.get('maxmem', 0)) for v in reserved),
                 'vcpuReserved': sum(int(v.get('maxcpu', 0)) for v in reserved), 'storageUsedBytes': storage.get('used'),
                 'storageTotalBytes': storage['total'], 'storageFreeBytes': storage['avail'], 'slotsFree': free_slots}
-        return {'hosts': [host], 'servers': servers}
+        return {'hosts': [host], 'servers': servers, 'publicIpv4': self.ipam.capacity(declared_ips(self.pve,self.c['node']))}
 
     def handle(self, request):
         require(isinstance(request, dict), 'Ожидается JSON object')
         action = request.get('action')
         require(action in ('create', 'status', 'readiness', 'password', 'suspend', 'unsuspend', 'cancel',
-                           'owner_start', 'owner_stop', 'admin', 'monitor'), 'Недопустимая операция')
+                           'owner_start', 'owner_stop', 'admin', 'monitor', 'network_capacity', 'network_reserve', 'network_payment_pending', 'network_release_hold'), 'Недопустимая операция')
+        if action.startswith('network_'):
+            try:
+                if action == 'network_capacity':
+                    return self.ipam.capacity(declared_ips(self.pve, self.c['node']))
+                if action == 'network_reserve':
+                    return self.ipam.reserve(request.get('account'), request.get('reference'), declared_ips(self.pve, self.c['node']))
+                if action == 'network_payment_pending':
+                    return self.ipam.payment_pending(request.get('account'), request.get('reference'), request.get('lease_id'))
+                if action == 'network_release_hold':
+                    return {'released': self.ipam.release_hold(request.get('account'), request.get('reference'), request.get('lease_id'), request.get('resolved') is True)}
+                raise Refused('Недопустимая сетевая операция')
+            except IpamRefused as exc:
+                raise Refused(str(exc)) from exc
         if action == 'monitor':
             return self.monitor()
         order, client = request.get('order_id'), request.get('client_id')
@@ -553,6 +691,13 @@ class Engine:
             key = request.get('ssh_key', '')
             require(key is None or isinstance(key, str), 'Некорректный публичный SSH-ключ')
             spec = {'plan': request['plan'], 'ssh_key': ssh_key(key) if key and key.strip() else None}
+            mode = request.get('network_mode', 'nat')
+            require(mode in ('nat', 'public_ipv4'), 'Неизвестный режим сети')
+            if mode == 'public_ipv4':
+                spec.update(network_mode=mode, account=request.get('account'), reference=request.get('reference'), lease_id=request.get('lease_id'))
+                # Validate identity and active hold before persisting allocation/credential.
+                lease = self.ipam._owned(spec['account'], spec['reference'], spec['lease_id'])
+                require(lease['state'] in ('held', 'assigned') and (lease['state'] == 'assigned' or lease['payment_pending'] or lease['expires_at'] > self.ipam.clock()), 'IPv4 резерв недействителен')
             row = self.reserve(order, client, spec)
             if row['phase'] == 'configured':
                 self.owned_config(row)
@@ -573,7 +718,8 @@ class Engine:
             info = self.info(row)
             if action == 'readiness':
                 info['ready'] = (info['ownership'] == 'owned' and info['phase'] == 'ready' and info['status'] == 'running'
-                                 and self.pve.ready(self.vmid(row), info['private_ip']))
+                                 and self.pve.ready(self.vmid(row), info['private_ip'])
+                                 and (info['network_mode'] != 'public_ipv4' or info['public_ip'] is not None and self.pve.public_ready(info['public_ip'])))
             return info
         if action == 'admin':
             return self.admin(row, request)
@@ -589,13 +735,17 @@ class Engine:
                     'Административная операция ещё выполняется')
             return self.power(row, action == 'owner_start')
         require(row['phase'] != 'cancelled' or action == 'cancel', 'Заказ отменён; операция запрещена')
-        require(row['phase'] in ('ready', 'stopped', 'suspended', 'blocked', 'cancelled'), 'Создание не завершено или VPS архивирован')
+        require(row['phase'] in ('ready', 'stopped', 'suspended', 'blocked', 'cancelled', 'canceling'), 'Создание не завершено или VPS архивирован')
         require(action != 'unsuspend' or row['phase'] not in ('cancelled', 'blocked'),
                 'Терминальный заказ или административная блокировка; запуск запрещён')
         # Native billing resume can lift its own suspension, never an explicit
         # audited admin block. Native suspend must preserve a pre-existing block.
         target = {'suspend': 'blocked' if row['phase'] == 'blocked' else 'suspended',
                   'unsuspend': 'ready', 'cancel': 'cancelled'}[action]
+        if action == 'cancel':
+            self.phase(row, 'canceling')
+            self.stop_vm(row)
+            self.isolate_public(row)
         return self.power(row, action == 'unsuspend', target)
 
 
@@ -610,7 +760,7 @@ def main():
     request = json.loads(raw)
     require(isinstance(request, dict), 'Ожидается JSON object')
     with (state / 'operation.lock').open('a') as lock:
-        read_only = request.get('action') in ('status', 'readiness', 'password', 'monitor')
+        read_only = request.get('action') in ('status', 'readiness', 'password', 'monitor', 'network_capacity')
         try:
             fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB if read_only else fcntl.LOCK_EX)
         except BlockingIOError as exc:

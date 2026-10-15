@@ -3,6 +3,8 @@
 """Only add web forwarding for VM 101; refuse foreign rules and listeners."""
 from pathlib import Path
 import shlex
+import json
+import ipaddress
 import subprocess
 import sys
 
@@ -52,16 +54,17 @@ def ensure(table, chain, rule):
 
 
 def apply():
+    public = str(ipaddress.IPv4Address(json.loads(Path('/etc/safehost-billing/config.json').read_text())['public_ip']))
     preflight()
     for table, chain in CHAINS.items():
         if run('iptables', '-w', '10', '-t', table, '-S', chain, check=False).returncode:
             run('iptables', '-w', '10', '-t', table, '-N', chain)
     for port in (80, 443):
-        ensure('nat', CHAINS['nat'], ['-i', 'vmbr0', '-d', '80.249.131.4/32', '-p', 'tcp',
+        ensure('nat', CHAINS['nat'], ['-i', 'vmbr0', '-d', public + '/32', '-p', 'tcp',
                '--dport', str(port), '-j', 'DNAT', '--to-destination', f'10.10.10.11:{port}'])
         ensure('filter', CHAINS['filter'], ['-i', 'vmbr0', '-o', 'vmbr1', '-d', '10.10.10.11/32',
                '-p', 'tcp', '--dport', str(port), '-m', 'conntrack', '--ctstate', 'NEW',
-               '--ctorigdst', '80.249.131.4', '--ctorigdstport', str(port), '-j', 'ACCEPT'])
+               '--ctorigdst', public, '--ctorigdstport', str(port), '-j', 'ACCEPT'])
     ensure('filter', CHAINS['filter'], ['-i', 'vmbr0', '-o', 'vmbr1', '-d', '10.10.10.11/32',
            '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT'])
     ensure('filter', CHAINS['filter'], ['-i', 'vmbr1', '-o', 'vmbr0', '-s', '10.10.10.11/32',

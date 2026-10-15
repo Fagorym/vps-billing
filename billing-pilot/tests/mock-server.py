@@ -12,8 +12,13 @@ spec.loader.exec_module(engine)
 from test_engine import FakePVE
 
 config = json.loads(Path('/config.json').read_text())
+from test_ipam import POOL
+config['public_network'] = POOL
 config['template_marker'] = 'proxmox-pilot:v1:template:demo'
 pve = FakePVE(config)
+pve.network_guard = lambda *args: None
+pve.public_ready = lambda address: True
+pve.apply_public_network = lambda *args: None
 saved = Path('/state/pve.json')
 if saved.exists():
     value = json.loads(saved.read_text())

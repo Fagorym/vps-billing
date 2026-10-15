@@ -73,6 +73,10 @@ class FakePVE:
                 self.crash_after_clone = False
                 raise OSError('lost clone response')
         elif verb == 'set':
+            if '--delete' in args:
+                for key in args[args.index('--delete') + 1].split(','):
+                    self.vms[vmid].pop(key, None)
+                return
             self.vms[vmid].update(dict(zip((s.removeprefix('--') for s in args[::2]), args[1::2])))
         elif verb in ('start', 'stop'):
             self.states[vmid] = 'running' if verb == 'start' else 'stopped'
@@ -128,6 +132,11 @@ class CLILockingContracts(unittest.TestCase):
     def test_password_fails_fast_while_a_mutation_is_running(self):
         completed, outcome = self.invoke_while_locked(fcntl.LOCK_EX, 'password')
         self.assertTrue(completed, 'Password lookup waited for a mutation')
+        self.assertEqual(outcome, [engine.Refused])
+
+    def test_capacity_fails_fast_while_a_mutation_is_running(self):
+        completed, outcome = self.invoke_while_locked(fcntl.LOCK_EX, 'network_capacity')
+        self.assertTrue(completed, 'Capacity lookup waited for a mutation')
         self.assertEqual(outcome, [engine.Refused])
 
     def test_mutation_still_waits_for_existing_readers(self):

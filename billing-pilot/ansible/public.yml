@@ -6,6 +6,11 @@
     ansible_ssh_private_key_file: "{{ pilot_host_key }}"
     ansible_ssh_common_args: "-o UserKnownHostsFile={{ pilot_known_hosts | quote }} -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ControlMaster=no -o ControlPath=none"
   tasks:
+    - name: Проверить hostname и endpoint до изменения конфигурации
+      ansible.builtin.assert:
+        that:
+          - billing_public_host is match('^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$')
+          - billing_public_host | length < 254
     - name: Проверить порты и чужие NAT-правила
       ansible.builtin.script:
         cmd: "{{ billing_root }}/public/nat.py --check"
@@ -15,7 +20,7 @@
       ansible.builtin.add_host:
         name: billing_vm
         groups: billing_public
-        ansible_host: 80.249.131.4
+        ansible_host: "{{ engine.public_ip }}"
         ansible_port: 2223
         ansible_user: vpsadmin
         ansible_ssh_private_key_file: "{{ pilot_guest_key }}"
@@ -69,7 +74,7 @@
         path: /etc/letsencrypt/live/safehost-billing-ip/fullchain.pem
       register: certificate
     - name: Сохранить начальную конфигурацию без доступа к биллингу по HTTP
-      ansible.builtin.copy:
+      ansible.builtin.template:
         src: "{{ billing_root }}/public/nginx-bootstrap.conf"
         dest: /etc/nginx/sites-available/safehost-billing
         mode: '0644'
@@ -139,7 +144,7 @@
   vars:
     certbot_image: certbot/certbot@sha256:c23159d30afdd9c97960578aa4654f5901de6cae394958f894074dedd55e599d
     certbot_base: "docker run --rm --network host -v /var/lib/letsencrypt:/var/lib/letsencrypt -v /var/log/letsencrypt:/var/log/letsencrypt -v /var/lib/safehost-acme:/var/www/acme"
-    certbot_request: "certonly --non-interactive --agree-tos --register-unsafely-without-email --preferred-profile shortlived --webroot --webroot-path /var/www/acme --ip-address 80.249.131.4 --cert-name safehost-billing-ip"
+    certbot_request: "certonly --non-interactive --agree-tos --register-unsafely-without-email --preferred-profile shortlived --webroot --webroot-path /var/www/acme {{ ('--ip-address ' + engine.public_ip) if billing_public_host == engine.public_ip else ('-d ' + billing_public_host) }} --cert-name safehost-billing-ip"
     compose: docker compose -p safehost-billing --project-directory /opt/billing-pilot -f /opt/billing-pilot/compose.yml
   tasks:
     - name: Проверить выпуск сертификата в staging
@@ -165,9 +170,9 @@
     - name: Передать настройку внутрь контейнера
       ansible.builtin.command: "docker cp /opt/billing-pilot/public/configure.php safehost-billing-billing-1:/tmp/safehost-public-configure.php"
     - name: Настроить HTTPS URL в FOSSBilling
-      ansible.builtin.command: "{{ compose }} exec -T --user 33:33 billing php /tmp/safehost-public-configure.php {{ proxy_gateway.stdout | trim }}"
+      ansible.builtin.command: "{{ compose }} exec -T --user 33:33 billing php /tmp/safehost-public-configure.php {{ proxy_gateway.stdout | trim }} {{ billing_public_host }}"
     - name: Включить nginx HTTPS и принудительный редирект с HTTP
-      ansible.builtin.copy:
+      ansible.builtin.template:
         src: "{{ billing_root }}/public/nginx.conf"
         dest: /etc/nginx/sites-available/safehost-billing
         mode: '0644'

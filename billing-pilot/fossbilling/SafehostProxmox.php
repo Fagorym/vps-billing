@@ -13,6 +13,8 @@ class SafehostProxmox
         $this->request('create', $order, [
             'plan' => $this->config['plan'] ?? '',
             'ssh_key' => $data['ssh_key'] ?? '',
+            'network_mode'=>$data['network_mode']??'nat', 'lease_id'=>$data['lease_id']??null,
+            'account'=>$data['account']??null,'reference'=>$data['reference']??null,
         ]);
         return true;
     }

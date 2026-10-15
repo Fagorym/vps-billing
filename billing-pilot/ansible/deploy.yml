@@ -52,6 +52,15 @@
         fail_msg: Конфигурация пула изменилась. Нужна отдельная миграция; сеть и VM не меняем.
       when: existing_engine.stat.exists
 
+    - name: Передать модули сетевого allocator до обновления engine
+      ansible.builtin.copy:
+        src: "{{ billing_root }}/backend/{{ item }}"
+        dest: "/usr/local/lib/safehost-billing/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: [ipam.py, guest_network.py, network_boot.py, network_migrate.py, expand_pool.py]
+
     - name: Сохранить ограниченный адаптер
       ansible.builtin.copy:
         src: "{{ billing_root }}/backend/engine.py"
@@ -132,8 +141,8 @@
     - name: Закрепить SSH host key VM биллинга
       ansible.builtin.known_hosts:
         path: "{{ pilot_known_hosts }}"
-        name: '[80.249.131.4]:2223'
-        key: "[80.249.131.4]:2223 {{ ((guest_hostkey.stdout | from_json)['out-data']).split()[:2] | join(' ') }}"
+        name: "[{{ engine.public_ip }}]:2223"
+        key: "[{{ engine.public_ip }}]:2223 {{ ((guest_hostkey.stdout | from_json)['out-data']).split()[:2] | join(' ') }}"
       delegate_to: localhost
 
     - name: Прочитать SSH host key Proxmox для forced command
@@ -152,7 +161,7 @@
       ansible.builtin.add_host:
         name: billing_vm
         groups: billing_guests
-        ansible_host: 80.249.131.4
+        ansible_host: "{{ engine.public_ip }}"
         ansible_port: 2223
         ansible_user: vpsadmin
         ansible_ssh_private_key_file: "{{ pilot_guest_key }}"

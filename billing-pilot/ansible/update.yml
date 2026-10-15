@@ -29,6 +29,15 @@
       ansible.builtin.apt:
         name: [python3-cryptography, openssl]
         state: present
+    - name: Передать модули сетевого allocator до обновления engine
+      ansible.builtin.copy:
+        src: "{{ billing_root }}/backend/{{ item }}"
+        dest: "/usr/local/lib/safehost-billing/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: [ipam.py, guest_network.py, network_boot.py, network_migrate.py, expand_pool.py]
+
     - name: Обновить ограниченный адаптер
       ansible.builtin.copy:
         src: "{{ billing_root }}/backend/engine.py"
@@ -38,7 +47,7 @@
       ansible.builtin.add_host:
         name: billing_vm
         groups: billing_update
-        ansible_host: 80.249.131.4
+        ansible_host: "{{ engine.public_ip }}"
         ansible_port: 2223
         ansible_user: vpsadmin
         ansible_ssh_private_key_file: "{{ pilot_guest_key }}"

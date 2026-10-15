@@ -14,6 +14,11 @@ final class PortalBridge
         $this->db->exec('CREATE TABLE IF NOT EXISTS client (account TEXT PRIMARY KEY, client_id INTEGER NOT NULL UNIQUE)');
         $this->db->exec('CREATE TABLE IF NOT EXISTS orders (reference TEXT PRIMARY KEY, account TEXT NOT NULL UNIQUE, plan TEXT NOT NULL, order_id INTEGER UNIQUE)');
         $this->db->exec('CREATE TABLE IF NOT EXISTS retired_orders (reference TEXT PRIMARY KEY, account TEXT NOT NULL, plan TEXT NOT NULL, order_id INTEGER UNIQUE)');
+        foreach (['orders','retired_orders'] as $table) {
+            $columns = $this->db->query('PRAGMA table_info('.$table.')')->fetchAll(PDO::FETCH_COLUMN,1);
+            if (!in_array('network_mode',$columns,true)) { $this->db->exec("ALTER TABLE ".$table." ADD COLUMN network_mode TEXT NOT NULL DEFAULT 'nat'"); }
+            if (!in_array('lease_id',$columns,true)) { $this->db->exec('ALTER TABLE '.$table.' ADD COLUMN lease_id TEXT'); }
+        }
         chmod($directory . '/portal.sqlite', 0600);
         file_put_contents($directory . '/.htaccess', "Require all denied\n");
     }
@@ -44,8 +49,17 @@ final class PortalBridge
                 throw new InvalidArgumentException('Invalid identity');
             }
         }
-        if (!in_array($r['action'] ?? '', ['create', 'status', 'password', 'start', 'stop'], true)) {
+        if (!in_array($r['action'] ?? '', ['create', 'status', 'password', 'start', 'stop', 'network_capacity','network_reserve','network_payment_pending','network_release_hold'], true)) {
             throw new InvalidArgumentException('Invalid action');
+        }
+        if (str_starts_with($r['action'],'network_')) {
+            $payload=['action'=>$r['action'],'account'=>$r['account'],'reference'=>$r['reference']];
+            if(in_array($r['action'],['network_payment_pending','network_release_hold'],true)) {
+                if(!is_string($r['lease_id']??null)||!preg_match('/^[0-9a-f-]{36}$/D',$r['lease_id']))throw new InvalidArgumentException('Invalid lease identity');
+                $payload['lease_id']=$r['lease_id'];
+            }
+            if($r['action']==='network_release_hold')$payload['resolved']=($r['resolved']??false)===true;
+            return $this->foss->network($payload);
         }
         // Writers serialize reservation and activation. Reads share the lock and refuse a busy
         // writer immediately instead of queueing a credential request behind provisioning.
@@ -57,6 +71,10 @@ final class PortalBridge
             if (!$row) { $row = $this->row('SELECT * FROM retired_orders WHERE reference=?', [$r['reference']]); }
             if ($r['action'] === 'create') {
                 if (!in_array($r['plan'] ?? '', ['mini', 'small', 'medium'], true)) { throw new InvalidArgumentException('Invalid plan'); }
+                $mode=$r['network_mode']??'nat';
+                if(!in_array($mode,['nat','public_ipv4'],true))throw new InvalidArgumentException('Invalid network mode');
+                if($mode==='public_ipv4'&&(!is_string($r['lease_id']??null)||!preg_match('/^[0-9a-f-]{36}$/D',$r['lease_id'])))throw new InvalidArgumentException('Missing IPv4 lease');
+                if($row&&($row['network_mode']!==$mode||$mode==='public_ipv4'&&$row['lease_id']!==$r['lease_id']))throw new DomainException('Network reference conflict');
                 if ($row && ($row['account'] !== $r['account'] || $row['plan'] !== $r['plan'])) { throw new DomainException('Reference conflict'); }
                 if (!$row) {
                     $previous = $this->row('SELECT * FROM orders WHERE account=?', [$r['account']]);
@@ -69,11 +87,11 @@ final class PortalBridge
                         try {
                             $this->write('INSERT INTO retired_orders SELECT * FROM orders WHERE reference=?', [$previous['reference']]);
                             $this->write('DELETE FROM orders WHERE reference=?', [$previous['reference']]);
-                            $this->write('INSERT INTO orders(reference,account,plan) VALUES(?,?,?)', [$r['reference'], $r['account'], $r['plan']]);
+                            $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id) VALUES(?,?,?,?,?)', [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null]);
                             $this->db->commit();
                         } catch (Throwable $e) { $this->db->rollBack(); throw $e; }
                     } else {
-                    $this->write('INSERT INTO orders(reference,account,plan) VALUES(?,?,?)', [$r['reference'], $r['account'], $r['plan']]);
+                    $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id) VALUES(?,?,?,?,?)', [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null]);
                     }
                     $row = $this->row('SELECT * FROM orders WHERE reference=?', [$r['reference']]);
                 }
@@ -89,7 +107,7 @@ final class PortalBridge
             $clientId = (int) $client['client_id'];
             if (!$row['order_id']) {
                 if ($r['action'] !== 'create') { throw new OutOfBoundsException('Order not found'); }
-                $id = $this->foss->order($clientId, $r['reference'], $row['plan']);
+                $id = $this->foss->order($clientId, $r['reference'], $row['plan'], ['network_mode'=>$row['network_mode'],'lease_id'=>$row['lease_id'],'account'=>$r['account'],'reference'=>$r['reference']]);
                 $this->write('UPDATE orders SET order_id=? WHERE reference=?', [$id, $r['reference']]);
                 $row['order_id'] = $id;
             }
@@ -119,7 +137,8 @@ final class PortalBridge
             elseif (!in_array($phase, ['blocked','archived','deleted','cancelled','missing'], true)) { $phase = 'preparing'; }
             return ['order_id' => $id, 'phase' => $phase, 'reason' => $info['reason'] ?? null,
                 'status' => $info['status'], 'public_ip' => $info['public_ip'], 'ssh_port' => $info['ssh_port'],
-                'user' => $info['user'], 'ssh' => $info['ssh'], 'vmid' => $info['vmid']];
+                'user' => $info['user'], 'ssh' => $info['ssh'], 'vmid' => $info['vmid'],
+                'network_mode'=>$info['network_mode']??'nat','lease_id'=>$info['lease_id']??null,'lease_generation'=>$info['lease_generation']??null];
         } finally { flock($lock, LOCK_UN); fclose($lock); }
     }
 }
@@ -140,7 +159,7 @@ final class FossPortal
         return (int) $this->api->client_create(['email' => $email, 'first_name' => 'Portal', 'last_name' => $account,
             'password' => 'Portal1!' . bin2hex(random_bytes(32)), 'send_welcome_email' => false]);
     }
-    public function order(int $client, string $reference, string $plan): int
+    public function order(int $client, string $reference, string $plan, array $network=[]): int
     {
         $title = 'Portal ' . $reference;
         $existing = $this->di['db']->findOne('ClientOrder', 'client_id = :client AND title = :title', ['client' => $client, 'title' => $title]);
@@ -151,7 +170,12 @@ final class FossPortal
             return (int) $existing->id;
         }
         return (int) $this->api->order_create(['client_id' => $client, 'product_id' => $product, 'period' => '1M',
-            'title' => $title, 'config' => ['ssh_key' => ''], 'price' => 0, 'invoice_option' => 'no-invoice', 'activate' => false]);
+            'title' => $title, 'config' => array_merge(['ssh_key' => ''],$network), 'price' => 0, 'invoice_option' => 'no-invoice', 'activate' => false]);
+    }
+    public function network(array $request): array
+    {
+        require_once __DIR__.'/EngineGateway.php';
+        return (new EngineGateway())->network($request);
     }
     public function get(int $id): array
     {

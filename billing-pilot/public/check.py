@@ -2,6 +2,8 @@
 from pathlib import Path
 import http.cookiejar
 import json
+import os
+import ipaddress
 import socket
 import ssl
 import urllib.error
@@ -9,12 +11,13 @@ import urllib.parse
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = 'https://80.249.131.4/'
+HOST = os.environ.get('BILLING_PUBLIC_HOST', json.loads((ROOT/'config.json').read_text())['public_ip'])
+BASE = 'https://' + HOST + '/'
 context = ssl.create_default_context()
-with socket.create_connection(('80.249.131.4', 443), timeout=20) as tcp:
-    with context.wrap_socket(tcp, server_hostname='80.249.131.4') as tls:
+with socket.create_connection((HOST, 443), timeout=20) as tcp:
+    with context.wrap_socket(tcp, server_hostname=HOST) as tls:
         cert = tls.getpeercert()
-        assert ('IP Address', '80.249.131.4') in cert['subjectAltName']
+        assert any(value == HOST for kind,value in cert['subjectAltName'] if kind in ('IP Address','DNS'))
         certificate = {'expires': cert['notAfter'], 'tls': tls.version(),
                        'issuer': dict(item[0] for item in cert['issuer'])}
 
@@ -26,7 +29,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 plain = urllib.request.build_opener(NoRedirect())
 try:
-    plain.open('http://80.249.131.4/admin', timeout=20)
+    plain.open('http://' + HOST + '/admin', timeout=20)
     raise AssertionError('HTTP did not redirect')
 except urllib.error.HTTPError as exc:
     assert exc.code == 308 and exc.headers['Location'] == BASE + 'admin'

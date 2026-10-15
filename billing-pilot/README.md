@@ -244,3 +244,5 @@ create/status/password/suspend/unsuspend/cancel, проверяет order/client
 Образ FOSSBilling закреплён версией и digest в Dockerfile. MariaDB — `11.4.8`.
 Приватные ключи и пароли генерируются локально при первом запуске и не перезаписываются
 при повторном запуске.
+
+Публичный IPv4: [архитектура, оплата, архив, настройка Selectel и откат](PUBLIC-IPV4.md). Выдача выключена до настройки реальной подсети и canary.

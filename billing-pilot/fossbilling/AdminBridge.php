@@ -116,6 +116,7 @@ final class AdminBridge
             $servers[] = ['orderId' => (int) $s['orderId'], 'clientId' => $client, 'account' => $maps[$client] ?? null,
                 'name' => $order['title'] ?? ('VPS order ' . $s['orderId']), 'plan' => $s['plan'], 'vmid' => $s['vmid'], 'node' => $s['node'], 'phase' => $phase,
                 'status' => $s['status'], 'reason' => $order ? ($s['reason'] ?? null) : 'Заказ FOSSBilling удалён; retained VM доступна администратору', 'createdAt' => self::fossDate($s['createdAt'] ?? $order['activated_at'] ?? $order['created_at'] ?? null),
+                'networkMode'=>$s['network_mode']??'nat','leaseId'=>$s['lease_id']??null,
                 'publicIp' => $s['public_ip'] ?? null, 'sshPort' => $s['ssh_port'] ?? null, 'cores' => $s['cores'], 'memoryMb' => $s['memoryMb'], 'diskGb' => $s['diskGb'], 'metrics' => $metrics];
         }
         $clients = [];
@@ -136,7 +137,7 @@ final class AdminBridge
             'clientsTotal' => count($clients), 'clientsToday' => count(array_filter($clients, fn($c) => $today($c['registeredAt']))),
             'serversTotal' => count(array_filter($servers, fn($s) => $s['phase'] !== 'deleted')),
             'serversToday' => count(array_filter($servers, fn($s) => $today($s['createdAt'])))],
-            'clients' => $clients, 'servers' => $servers, 'hosts' => $hosts, 'events' => $events];
+            'clients' => $clients, 'servers' => $servers, 'hosts' => $hosts, 'events' => $events,'publicIpv4'=>$infra['publicIpv4']??null];
     }
     private function enqueue(array $r, array $actor): array
     {
