@@ -281,10 +281,13 @@ class Engine:
             self.pve.command('set', vmid, '--net1', self.public_nic(row, lease, down=True),
                              '--ipconfig1', f'ip={lease["address"]}/{self.public_prefix()},gw={self.c["public_network"]["gateway"]}')
             self.pve.network_guard(row, lease, self.c)
+            # Boot needs carrier to finish network-online. The installed bridge
+            # guard already drops every source except the newly assigned IP,
+            # including the archived address until netplan is repaired.
+            self.pve.command('set', vmid, '--net1', self.public_nic(row, lease))
             if self.pve.status(vmid) != 'running':
                 self.pve.command('start', vmid)
             self.pve.apply_public_network(row, lease, self.c)
-            self.pve.command('set', vmid, '--net1', self.public_nic(row, lease))
             require(self.pve.ready(vmid, str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])) and self.pve.public_ready(lease['address']), 'Сеть восстанавливаемой VM ещё не готова')
             self.pve.command('set', vmid, '--onboot', '1')
             self.phase(row, 'ready')

@@ -93,6 +93,25 @@ class PublicEngineTests(unittest.TestCase):
         self.assertGreaterEqual(len(probes),3)
         self.assertEqual(self.e.handle({'action':'network_capacity'})['assigned'],1)
 
+    def test_restore_enables_carrier_after_lease_guard_before_boot(self):
+        self.public_create()
+        context={'reason':'restore with protected network carrier','actor':{'account':ACCOUNT,'email':'operator@example.test'}}
+        self.handle('admin',command='archive',operation_id=str(uuid.uuid4()),**context)
+        guards=[]
+        self.pve.network_guard=lambda row,lease,config:guards.append(lease['state'])
+        command=self.pve.command
+        def guarded_command(verb,vmid,*args):
+            if verb=='set' and '--net1' in args and 'link_down=1' not in args[args.index('--net1')+1]:
+                self.assertEqual(guards[-1:],['assigned'])
+            if verb=='start':
+                self.assertEqual(guards[-1:],['assigned'])
+                self.assertNotIn('link_down=1',self.pve.config(vmid)['net1'])
+            return command(verb,vmid,*args)
+        self.pve.command=guarded_command
+        result=self.handle('admin',command='restore',operation_id=str(uuid.uuid4()),**context)
+        self.assertEqual(result['phase'],'ready')
+        self.assertEqual(self.pve.status(1100),'running')
+
     def test_restore_boot_timeout_keeps_archive_and_releases_isolated_lease(self):
         self.public_create()
         context={'reason':'restore boot timeout','actor':{'account':ACCOUNT,'email':'operator@example.test'}}
