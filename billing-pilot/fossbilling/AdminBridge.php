@@ -238,7 +238,7 @@ final class FossAdmin
     }
     public function clients(): array
     {
-        $clients = $this->all('client_get_list');
+        $clients = array_values(array_filter($this->all('client_get_list'), static fn(array $client): bool => ($client['status'] ?? 'active') === 'active'));
         $default = $this->api->currency_get_default();
         foreach ($clients as &$c) {
             // DECIMAL source stays exact; the native API's float total loses precision for large balances.
