@@ -51,6 +51,11 @@ class FakePVE:
     def config(self, vmid, kind='qemu'):
         return copy.deepcopy(self.vms[vmid])
 
+    def network_configs(self, node, exclude=None):
+        return [{'type':guest['type'],'config':self.config(vmid,guest['type'])}
+                for vmid,guest in self.guests().items()
+                if vmid!=exclude and guest['node']==node and guest['type'] in ('qemu','lxc')]
+
     def check_capacity(self, plan):
         pass
 

@@ -61,10 +61,8 @@ def run(args):
 def declared_ips(pve, node, exclude=None):
     """Both QEMU and LXC declared addresses; called again at purchase, not just deploy."""
     used = set()
-    for vmid, guest in pve.guests().items():
-        if vmid == exclude or guest['node'] != node or guest['type'] not in ('qemu', 'lxc'):
-            continue
-        cfg = pve.config(vmid, guest['type'])
+    for guest in pve.network_configs(node, exclude):
+        cfg = guest['config']
         fields = ('ipconfig',) if guest['type'] == 'qemu' else ('net',)
         for key, value in cfg.items():
             if key.startswith(fields):
@@ -89,6 +87,32 @@ class Proxmox:
 
     def config(self, vmid, kind='qemu'):
         return self.api(f'/nodes/{self.c["node"]}/{kind}/{vmid}/config')
+
+    def network_configs(self, node, exclude=None):
+        # One canonical Proxmox read avoids a separate pvesh startup per VM.
+        script = r'''
+PVE::Cluster::cfs_update();
+my ($node, $exclude) = @ARGV;
+my $vms = PVE::Cluster::get_vmlist();
+my @rows;
+for my $id (sort {$a <=> $b} keys %{$vms->{ids}}) {
+    my $guest = $vms->{ids}{$id};
+    next if $guest->{node} ne $node || "$id" eq $exclude;
+    my ($config, $prefix);
+    if ($guest->{type} eq 'qemu') {
+        $config = PVE::QemuConfig->load_current_config($id, 0); $prefix = 'ipconfig';
+    } elsif ($guest->{type} eq 'lxc') {
+        $config = PVE::LXC::Config->load_current_config($id, 0); $prefix = 'net';
+    } else { next; }
+    my %network = map {$_ => $config->{$_}} grep {index($_, $prefix) == 0} keys %$config;
+    push @rows, {type => $guest->{type}, config => \%network};
+}
+print encode_json(\@rows);
+'''
+        return json.loads(subprocess.check_output([
+            '/usr/bin/perl', '-MPVE::QemuConfig', '-MPVE::LXC::Config', '-MJSON::PP',
+            '-e', script, node, '' if exclude is None else str(exclude)
+        ], text=True, timeout=10))
 
     def command(self, verb, vmid, *args):
         return run(['/usr/sbin/qm', verb, str(vmid), *map(str, args)])

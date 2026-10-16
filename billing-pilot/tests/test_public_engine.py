@@ -10,6 +10,7 @@ import unittest
 import uuid
 import subprocess
 import pathlib
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 import guest_network
@@ -33,6 +34,36 @@ class PublicEngineTests(unittest.TestCase):
 
     def reserve_ip(self):
         return self.e.handle({'action':'network_reserve', **self.network})
+
+    def test_native_capacity_reads_canonical_network_configs_in_one_process(self):
+        configs=[{'type':'qemu','config':{'ipconfig0':'ip=198.51.100.3/29','net0':'ip=198.51.100.8/29'}},
+                 {'type':'lxc','config':{'net0':'name=eth0,ip=198.51.100.4/29','ipconfig0':'ip=198.51.100.9/29'}}]
+        with patch.object(engine,'run',side_effect=AssertionError('Per-VM CLI scan exceeds capacity deadline')),patch.object(engine.subprocess,'check_output',return_value=json.dumps(configs)) as batch:
+            used=engine.declared_ips(engine.Proxmox(self.config),'pve1',exclude=1106)
+        self.assertEqual(used,{'198.51.100.3','198.51.100.4'})
+        batch.assert_called_once()
+        self.assertEqual(batch.call_args.args[0][-2:],['pve1','1106'])
+
+    def test_native_capacity_fails_closed_when_config_read_fails(self):
+        with patch.object(engine,'run',side_effect=AssertionError('Unexpected per-VM scan')),patch.object(engine.subprocess,'check_output',side_effect=subprocess.CalledProcessError(1,['perl'])):
+            with self.assertRaises(subprocess.CalledProcessError):
+                engine.declared_ips(engine.Proxmox(self.config),'pve1')
+
+    def test_native_batch_filters_node_exclusion_and_qemu_lxc_fields(self):
+        modules=Path(self.temp.name)/'perl'
+        (modules/'PVE/LXC').mkdir(parents=True)
+        (modules/'PVE/Cluster.pm').write_text('package PVE::Cluster; use JSON::PP; sub cfs_update {} sub get_vmlist {decode_json($ENV{SAFEHOST_TEST_VMLIST})} 1;')
+        for package,path in [('PVE::QemuConfig','PVE/QemuConfig.pm'),('PVE::LXC::Config','PVE/LXC/Config.pm')]:
+            (modules/path).write_text('package '+package+'; use JSON::PP; use PVE::Cluster; sub load_config {my ($class,$id)=@_; my $c=decode_json($ENV{SAFEHOST_TEST_CONFIGS}); die "Missing config" unless exists $c->{$id}; return $c->{$id};} sub load_current_config {my ($class,$id,$current)=@_; die "Expected pending-effective projection" unless defined($current) && $current == 0; return $class->load_config($id)->{effective};} 1;')
+        guests={'1':{'node':'pve1','type':'qemu'},'2':{'node':'pve1','type':'lxc'},
+                '3':{'node':'other','type':'qemu'},'4':{'node':'pve1','type':'qemu'}}
+        configs={'1':{'ipconfig0':'ip=198.51.100.3/29','effective':{'ipconfig0':'ip=198.51.100.5/29','net0':'ip=198.51.100.8/29'}},
+                 '2':{'net0':'ip=198.51.100.4/29','effective':{'net0':'ip=198.51.100.6/29','ipconfig0':'ip=198.51.100.9/29'}}}
+        with patch.dict(os.environ,{'PERL5LIB':str(modules),'SAFEHOST_TEST_VMLIST':json.dumps({'ids':guests}),'SAFEHOST_TEST_CONFIGS':json.dumps(configs)}):
+            used=engine.declared_ips(engine.Proxmox(self.config),'pve1',exclude=4)
+            self.assertEqual(used,{'198.51.100.5','198.51.100.6'})
+            with self.assertRaises(subprocess.CalledProcessError):
+                engine.declared_ips(engine.Proxmox(self.config),'pve1')
 
     def public_create(self):
         lease = self.reserve_ip()
