@@ -1,9 +1,9 @@
 # Конфигурация текущего Selectel. Публичную сеть playbook не переписывает.
 pilot:
   node: pve1
-  public_ip: 80.249.131.4
-  public_cidr: 80.249.131.4/24
-  public_gateway: 80.249.131.1
+  public_ip: 45.9.88.50
+  public_cidr: 45.9.88.50/28
+  public_gateway: 45.9.88.49
   uplink: vmbr0
   physical_nic: nic0
   physical_mac: 30:9c:23:0a:eb:bf

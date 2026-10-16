@@ -3,7 +3,7 @@ all:
     proxmox:
       hosts:
         pve1:
-          ansible_host: 80.249.131.4
+          ansible_host: 45.9.88.50
           ansible_user: root
           ansible_port: 22
           ansible_python_interpreter: /usr/bin/python3

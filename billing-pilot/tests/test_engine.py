@@ -19,6 +19,13 @@ spec.loader.exec_module(engine)
 KEY = 'ssh-ed25519 ' + base64.b64encode(struct.pack('>I', 11) + b'ssh-ed25519' + struct.pack('>I', 32) + bytes(range(32))).decode()
 
 
+def nat_configuration():
+    config = json.loads((ROOT / 'config.json').read_text())
+    config.pop('public_network', None)
+    config['template_marker'] = 'proxmox-pilot:v1:template:test'
+    return config
+
+
 class FakePVE:
     def __init__(self, config):
         self.c = config
@@ -167,8 +174,7 @@ class EngineTests(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.config = json.loads((ROOT / 'config.json').read_text())
-        self.config['template_marker'] = 'proxmox-pilot:v1:template:test'
+        self.config = nat_configuration()
         self.pve = FakePVE(self.config)
         self.e = engine.Engine(self.config, Path(self.temp.name) / 'state', Path(self.temp.name) / 'snippets', self.pve)
         self.req = {'action': 'create', 'order_id': 1, 'client_id': 2, 'plan': 'mini', 'ssh_key': KEY}

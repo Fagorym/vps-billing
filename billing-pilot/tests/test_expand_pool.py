@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 from jinja2 import Template
 
-from test_engine import engine, FakePVE, KEY, ROOT
+from test_engine import engine, FakePVE, KEY, ROOT, nat_configuration
 
 spec = importlib.util.spec_from_file_location('expand_pool', ROOT / 'backend/expand_pool.py')
 pool = importlib.util.module_from_spec(spec)
@@ -53,7 +53,7 @@ class ExpansionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.c = json.loads((ROOT / 'config.json').read_text())
+        self.c = nat_configuration()
         self.c.update(slots=5, template_marker='proxmox-pilot:v1:template:test')
         self.desired = {**self.c, 'slots': 10}
         self.config = self.root / 'config.json'

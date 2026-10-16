@@ -11,7 +11,7 @@ from test_ipam import POOL
 class NetworkMigrationTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name)
-        self.old=json.loads((fixtures.ROOT/'config.json').read_text());self.old['template_marker']='test'
+        self.old=fixtures.nat_configuration();self.old['template_marker']='test'
         self.pve=fixtures.FakePVE(self.old)
         self.engine=fixtures.engine.Engine(self.old,self.root/'state',self.root/'snippets',self.pve)
         self.engine.handle({'action':'create','order_id':1,'client_id':2,'plan':'mini','ssh_key':fixtures.KEY})

@@ -1,20 +1,48 @@
 {
-  "version": 1,
-  "public_ip": "80.249.131.4",
-  "node": "pve1",
-  "template_id": 9000,
-  "storage": "local-lvm",
   "bridge": "vmbr1",
-  "gateway": "10.10.10.1",
-  "subnet": "10.10.10.0/24",
   "dns": "1.1.1.1",
-  "vm_first": 1100,
-  "slots": 10,
+  "gateway": "10.10.10.1",
   "ip_first": "10.10.10.20",
-  "ssh_port_first": 22220,
+  "node": "pve1",
   "plans": {
-    "mini": {"cores": 1, "memory_mb": 1024, "disk_gb": 20, "price": 390},
-    "small": {"cores": 2, "memory_mb": 2048, "disk_gb": 50, "price": 650},
-    "medium": {"cores": 4, "memory_mb": 4096, "disk_gb": 80, "price": 1100}
-  }
+    "medium": {
+      "cores": 4,
+      "disk_gb": 80,
+      "memory_mb": 4096,
+      "price": 1100
+    },
+    "mini": {
+      "cores": 1,
+      "disk_gb": 20,
+      "memory_mb": 1024,
+      "price": 390
+    },
+    "small": {
+      "cores": 2,
+      "disk_gb": 50,
+      "memory_mb": 2048,
+      "price": 650
+    }
+  },
+  "public_ip": "45.9.88.50",
+  "public_network": {
+    "bridge": "vmbr0",
+    "cidr": "45.9.88.48/28",
+    "enabled": false,
+    "gateway": "45.9.88.49",
+    "host_ip": "45.9.88.50",
+    "pool_id": "selectel-spb4",
+    "reserved": [
+      "45.9.88.61",
+      "45.9.88.62"
+    ]
+  },
+  "slots": 10,
+  "ssh_port_first": 22220,
+  "storage": "local-lvm",
+  "subnet": "10.10.10.0/24",
+  "template_id": 9000,
+  "template_marker": "proxmox-pilot:v1:template:0d6ea4e342b7f9788dff0a6dc5e565a3386dc46085601b3822c89600a5575182",
+  "version": 1,
+  "vm_first": 1100
 }

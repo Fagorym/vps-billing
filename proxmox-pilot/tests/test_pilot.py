@@ -19,15 +19,15 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG = yaml.safe_load((ROOT / "group_vars/proxmox.yml").read_text())["pilot"]
 GUEST_ID = CONFIG["vps"]["id"]
 KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICVxZgPnLAIpVBPrZph2PefMEQyw53INofmNiGHKTrYX fixture"
-MAIN = """auto lo
+MAIN = f"""auto lo
 iface lo inet loopback
 
 iface nic0 inet manual
 
 auto vmbr0
 iface vmbr0 inet static
-    address 80.249.131.4/24
-    gateway 80.249.131.1
+    address {CONFIG['public_cidr']}
+    gateway {CONFIG['public_gateway']}
     bridge-ports nic0
     bridge-stp off
     bridge-fd 0
@@ -249,7 +249,7 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_public_network_mismatch_and_foreign_bridge_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "Публичная сеть"):
-            validate_network_files(CONFIG, MAIN.replace("gateway 80.249.131.1", "gateway 80.249.131.2"), {}, "")
+            validate_network_files(CONFIG, MAIN.replace(f"gateway {CONFIG['public_gateway']}", "gateway 192.0.2.1"), {}, "")
         with self.assertRaisesRegex(ValueError, "чужой"):
             validate_network_files(CONFIG, MAIN + "\niface vmbr1 inet static\n    bridge-ports none\n", {}, "")
 
@@ -298,9 +298,9 @@ class ConfigurationTests(unittest.TestCase):
     def test_nat_is_scoped_and_never_flushes_global_tables(self):
         script = self.render("roles/host/templates/nat.sh.j2")
         subprocess.run(["/bin/sh", "-n"], input=script, text=True, check=True)
-        self.assertIn("-d 80.249.131.4/32 -p tcp --dport 2222", script)
+        self.assertIn(f"-d {CONFIG['public_ip']}/32 -p tcp --dport 2222", script)
         self.assertIn("--to-destination 10.10.10.10:22", script)
-        self.assertIn("--ctorigdst 80.249.131.4 --ctorigdstport 2222", script)
+        self.assertIn(f"--ctorigdst {CONFIG['public_ip']} --ctorigdstport 2222", script)
         self.assertNotIn("--dport 8006", script)
         self.assertNotIn("-F FORWARD", script)
         self.assertNotIn("iptables-restore", script)
