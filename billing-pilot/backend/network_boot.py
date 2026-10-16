@@ -6,7 +6,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-from urllib.parse import unquote
 from expand_pool import fingerprint, require
 from guest_network import guard
 
@@ -27,7 +26,10 @@ def reload_guards(config_path='/etc/safehost-billing/config.json',state='/var/li
             source=Path(pve_configs)/f'{vmid}.conf'
             if not source.exists():continue
             marker=f'safehost-billing:v1:order:{row["order_id"]}:client:{row["client_id"]}:'+fingerprint(spec)
-            require(('description: '+marker) in [unquote(line) for line in source.read_text().splitlines()],'VMID занят чужой VM; запуск остановлен')
+            # Proxmox stores descriptions as encoded comments. Its local API
+            # provides the same canonical ownership value used by the engine.
+            vm=json.loads(subprocess.check_output(['/usr/bin/pvesh','get',f'/nodes/{config["node"]}/qemu/{vmid}/config','--output-format','json'],text=True,timeout=15))
+            require(vm.get('description')==marker and not vm.get('template'),'VMID занят чужой VM; запуск остановлен')
             lease=db.execute('SELECT * FROM ipv4_lease WHERE order_id=? AND client_id=? ORDER BY generation DESC LIMIT 1',(row['order_id'],row['client_id'])).fetchone()
             require(lease is not None,'Потеряна история IPv4; запуск остановлен')
             rules.append(guard(row,dict(lease),config))

@@ -8,7 +8,7 @@ import time
 sys.path.insert(0,'/backend')
 from guest_network import guard, mac
 
-CONFIG={'vm_first':1100,'ip_first':'10.10.10.20','gateway':'10.10.10.1','public_network':{'pool_id':'test','cidr':'198.51.100.0/29','gateway':'198.51.100.1','host_ip':'198.51.100.2','bridge':'vmbr0','reserved':[]}}
+CONFIG={'node':'pve1','vm_first':1100,'ip_first':'10.10.10.20','gateway':'10.10.10.1','public_network':{'pool_id':'test','cidr':'198.51.100.0/29','gateway':'198.51.100.1','host_ip':'198.51.100.2','bridge':'vmbr0','reserved':[]}}
 ROW={'slot':0,'order_id':1,'client_id':2};LEASE={'address':'198.51.100.3'}
 def run(*args,input=None):
  result=subprocess.run(args,input=input,text=True,capture_output=True)
@@ -97,6 +97,7 @@ print('PASS: archived guest cannot transmit released address')
 
 # Boot regenerates rules from canonical SQLite, not stale .nft snapshots.
 import tempfile,json,sqlite3
+from unittest.mock import patch
 from pathlib import Path
 from urllib.parse import quote
 from ipam import Ipam
@@ -114,14 +115,18 @@ with tempfile.TemporaryDirectory() as root:
  db.execute('CREATE TABLE allocation(order_id INTEGER PRIMARY KEY,client_id INTEGER,slot INTEGER UNIQUE,spec TEXT,phase TEXT,reason TEXT,created_at TEXT)')
  db.execute('INSERT INTO allocation VALUES(1,2,0,?,"ready",NULL,NULL)',(json.dumps(spec),));db.commit()
  marker='safehost-billing:v1:order:1:client:2:'+fingerprint(spec)
- (configs/'1100.conf').write_text('description: '+quote(marker,safe='')+'\n')
- reload_guards(config_file,state,configs)
+ (configs/'1100.conf').write_text('#'+quote(marker,safe='')+'\n')
+ with patch('network_boot.subprocess.check_output',return_value=json.dumps({'description':marker})):
+  reload_guards(config_file,state,configs)
  assert delivered(guest,wan,packet(mac(ROW,1),0x0800,ipv4('198.51.100.3','8.8.8.8'),WAN))
- allocator.release_assigned(1,2,lease['id'],isolated=True);reload_guards(config_file,state,configs)
+ allocator.release_assigned(1,2,lease['id'],isolated=True)
+ with patch('network_boot.subprocess.check_output',return_value=json.dumps({'description':marker})):
+  reload_guards(config_file,state,configs)
  assert not delivered(guest,wan,packet(mac(ROW,1),0x0800,ipv4('198.51.100.3','8.8.8.8'),WAN))
- (configs/'1100.conf').write_text('description: foreign VM\n')
- try:reload_guards(config_file,state,configs);raise AssertionError('Foreign VM accepted at boot')
- except ValueError:pass
+ (configs/'1100.conf').write_text('#foreign VM\n')
+ with patch('network_boot.subprocess.check_output',return_value=json.dumps({'description':'foreign VM'})):
+  try:reload_guards(config_file,state,configs);raise AssertionError('Foreign VM accepted at boot')
+  except ValueError:pass
  db.close()
 remove_guard(1100)
 assert delivered(guest,wan,packet(mac(ROW,1),0x0800,ipv4('198.51.100.3','8.8.8.8'),WAN))

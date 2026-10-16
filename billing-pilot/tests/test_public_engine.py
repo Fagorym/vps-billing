@@ -13,6 +13,8 @@ import pathlib
 from types import SimpleNamespace
 from unittest.mock import patch
 import guest_network
+import network_boot
+from urllib.parse import quote
 
 class PublicEngineTests(unittest.TestCase):
     handle = fixtures.EngineTests.handle
@@ -166,6 +168,26 @@ class PublicEngineTests(unittest.TestCase):
         self.assertEqual(self.handle('status')['phase'],'archived')
         self.assertIsNone(self.handle('status')['public_ip'])
         self.assertEqual(self.e.handle({'action':'network_capacity'})['free'],1)
+
+    def boot_paths(self):
+        root=Path(self.temp.name);config=root/'config.json';config.write_text(json.dumps(self.config))
+        configs=root/'pve';configs.mkdir()
+        (configs/'1100.conf').write_text('#'+quote(self.pve.config(1100)['description'],safe='')+'\n')
+        return config,root/'state',configs
+
+    def test_boot_guard_reads_canonical_proxmox_description(self):
+        self.public_create();paths=self.boot_paths()
+        with patch.object(network_boot.subprocess,'check_output',return_value=json.dumps(self.pve.config(1100))) as parsed,patch.object(network_boot.subprocess,'run',return_value=SimpleNamespace(stdout='')) as nft:
+            network_boot.reload_guards(*paths)
+        parsed.assert_called_once_with(['/usr/bin/pvesh','get','/nodes/pve1/qemu/1100/config','--output-format','json'],text=True,timeout=15)
+        self.assertEqual(nft.call_args_list[-1].args[0],['/usr/sbin/nft','-f','-'])
+        self.assertIn('table bridge safehost_1100',nft.call_args_list[-1].kwargs['input'])
+
+    def test_boot_guard_rejects_foreign_proxmox_description_before_applying_rules(self):
+        self.public_create();paths=self.boot_paths()
+        with patch.object(network_boot.subprocess,'check_output',return_value=json.dumps({'description':'foreign VM'})),patch.object(network_boot.subprocess,'run',return_value=SimpleNamespace(stdout='')) as nft:
+            with self.assertRaises(ValueError):network_boot.reload_guards(*paths)
+        self.assertEqual(nft.call_count,1)
 
     def test_lost_detach_response_resumes_archive_without_leaking_lease(self):
         self.public_create()
