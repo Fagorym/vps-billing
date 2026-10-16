@@ -57,9 +57,15 @@ class PublicEngineTests(unittest.TestCase):
             (modules/path).write_text('package '+package+'; use JSON::PP; use PVE::Cluster; sub load_config {my ($class,$id)=@_; my $c=decode_json($ENV{SAFEHOST_TEST_CONFIGS}); die "Missing config" unless exists $c->{$id}; return $c->{$id};} sub load_current_config {my ($class,$id,$current)=@_; die "Expected pending-effective projection" unless defined($current) && $current == 0; return $class->load_config($id)->{effective};} 1;')
         guests={'1':{'node':'pve1','type':'qemu'},'2':{'node':'pve1','type':'lxc'},
                 '3':{'node':'other','type':'qemu'},'4':{'node':'pve1','type':'qemu'}}
-        configs={'1':{'ipconfig0':'ip=198.51.100.3/29','effective':{'ipconfig0':'ip=198.51.100.5/29','net0':'ip=198.51.100.8/29'}},
+        configs={'1':{'description':'raw pending marker','ipconfig0':'ip=198.51.100.3/29',
+                      'effective':{'description':'canonical ownership marker','scsi0':'local-lvm:vm-1-disk-0',
+                                   'ipconfig0':'ip=198.51.100.5/29','net0':'ip=198.51.100.8/29'}},
                  '2':{'net0':'ip=198.51.100.4/29','effective':{'net0':'ip=198.51.100.6/29','ipconfig0':'ip=198.51.100.9/29'}}}
         with patch.dict(os.environ,{'PERL5LIB':str(modules),'SAFEHOST_TEST_VMLIST':json.dumps({'ids':guests}),'SAFEHOST_TEST_CONFIGS':json.dumps(configs)}):
+            snapshot=engine.Proxmox(self.config).current_configs('pve1',exclude=4)
+            self.assertEqual({row['vmid']:row['type'] for row in snapshot},{1:'qemu',2:'lxc'})
+            self.assertEqual(snapshot[0]['config'],configs['1']['effective'])
+            self.assertEqual(snapshot[1]['config'],configs['2']['effective'])
             used=engine.declared_ips(engine.Proxmox(self.config),'pve1',exclude=4)
             self.assertEqual(used,{'198.51.100.5','198.51.100.6'})
             with self.assertRaises(subprocess.CalledProcessError):
@@ -79,6 +85,27 @@ class PublicEngineTests(unittest.TestCase):
         self.assertEqual(cfg['ipconfig1'], 'ip=198.51.100.3/29,gw=198.51.100.1')
         self.assertEqual(self.e.handle({'action':'network_capacity'})['assigned'], 1)
 
+    def test_monitor_snapshot_preserves_public_ownership_and_foreign_ip_capacity(self):
+        self.public_create()
+        self.pve.vms[101] = {'_type': 'lxc', 'net0': 'name=eth0,ip=198.51.100.4/29',
+                             'net1': 'name=eth1,ip=10.10.10.21/24'}
+        self.pve.states[101] = 'running'
+        def snapshot(node):
+            return [{'vmid': vmid, 'type': guest['type'], 'config': self.pve.config(vmid, guest['type'])}
+                    for vmid, guest in self.pve.guests().items() if guest['node'] == node]
+        with patch.object(self.pve, 'current_configs', side_effect=snapshot, create=True):
+            report = self.e.handle({'action': 'monitor'})
+            self.assertEqual(report['servers'][0]['ownership'], 'owned')
+            self.assertEqual(report['publicIpv4']['assigned'], 1)
+            self.assertEqual(report['publicIpv4']['free'], 0)
+            self.assertEqual(report['hosts'][0]['slotsFree'], self.config['slots'] - 2)
+            original = self.pve.config(1100)
+            for field, value in {'net1': 'virtio=00:00:00:00:00:00,bridge=vmbr0',
+                                 'ipconfig1': 'ip=198.51.100.4/29,gw=198.51.100.1'}.items():
+                with self.subTest(field=field):
+                    self.pve.vms[1100] = {**original, field: value}
+                    server = self.e.handle({'action': 'monitor'})['servers'][0]
+                    self.assertEqual((server['ownership'], server['phase']), ('foreign', 'missing'))
     def test_public_create_cannot_invent_lease(self):
         with self.assertRaises(ValueError):
             self.handle('create', network_mode='public_ipv4', lease_id=str(uuid.uuid4()), **self.network)

@@ -58,10 +58,11 @@ def run(args):
     return result.stdout
 
 
-def declared_ips(pve, node, exclude=None):
+def declared_ips(pve, node, exclude=None, *, configs=None):
     """Both QEMU and LXC declared addresses; called again at purchase, not just deploy."""
     used = set()
-    for guest in pve.network_configs(node, exclude):
+    observed_configs = configs if configs is not None else pve.network_configs(node, exclude)
+    for guest in observed_configs:
         cfg = guest['config']
         fields = ('ipconfig',) if guest['type'] == 'qemu' else ('net',)
         for key, value in cfg.items():
@@ -88,7 +89,7 @@ class Proxmox:
     def config(self, vmid, kind='qemu'):
         return self.api(f'/nodes/{self.c["node"]}/{kind}/{vmid}/config')
 
-    def network_configs(self, node, exclude=None):
+    def current_configs(self, node, exclude=None):
         # One canonical Proxmox read avoids a separate pvesh startup per VM.
         script = r'''
 PVE::Cluster::cfs_update();
@@ -98,14 +99,13 @@ my @rows;
 for my $id (sort {$a <=> $b} keys %{$vms->{ids}}) {
     my $guest = $vms->{ids}{$id};
     next if $guest->{node} ne $node || "$id" eq $exclude;
-    my ($config, $prefix);
+    my $config;
     if ($guest->{type} eq 'qemu') {
-        $config = PVE::QemuConfig->load_current_config($id, 0); $prefix = 'ipconfig';
+        $config = PVE::QemuConfig->load_current_config($id, 0);
     } elsif ($guest->{type} eq 'lxc') {
-        $config = PVE::LXC::Config->load_current_config($id, 0); $prefix = 'net';
+        $config = PVE::LXC::Config->load_current_config($id, 0);
     } else { next; }
-    my %network = map {$_ => $config->{$_}} grep {index($_, $prefix) == 0} keys %$config;
-    push @rows, {type => $guest->{type}, config => \%network};
+    push @rows, {vmid => 0 + $id, type => $guest->{type}, config => $config};
 }
 print encode_json(\@rows);
 '''
@@ -113,6 +113,12 @@ print encode_json(\@rows);
             '/usr/bin/perl', '-MPVE::QemuConfig', '-MPVE::LXC::Config', '-MJSON::PP',
             '-e', script, node, '' if exclude is None else str(exclude)
         ], text=True, timeout=10))
+
+    def network_configs(self, node, exclude=None):
+        return [{'type': guest['type'], 'config': {
+                    key: value for key, value in guest['config'].items()
+                    if key.startswith('ipconfig' if guest['type'] == 'qemu' else 'net')}}
+                for guest in self.current_configs(node, exclude)]
 
     def command(self, verb, vmid, *args):
         return run(['/usr/sbin/qm', verb, str(vmid), *map(str, args)])
@@ -229,12 +235,13 @@ class Engine:
     def vmid(self, row):
         return self.c['vm_first'] + row['slot']
 
-    def owned_config(self, row, guests=None):
+    def owned_config(self, row, guests=None, *, configs=None):
         vmid = self.vmid(row)
         guest = (guests if guests is not None else self.pve.guests()).get(vmid)
         require(guest is not None and guest['node'] == self.c['node'] and guest['type'] == 'qemu',
                 'Управляемая VM не найдена на заданном узле')
-        cfg = self.pve.config(vmid)
+        cfg = self.pve.config(vmid) if configs is None else configs.get(vmid)
+        require(cfg is not None, 'Управляемая конфигурация VM не найдена')
         require(cfg.get('description') == self.marker(row) and not cfg.get('template'),
                 'VMID занят чужой VM или изменена метка владельца')
         require(not cfg.get('lock'), 'VM заблокирована; повторите после завершения задачи')
@@ -623,18 +630,20 @@ class Engine:
         self.phase(row, 'ready')
         return self.info(row)
 
-    def info(self, row):
+    def info(self, row, *, guests=None, configs=None):
         current_row = self.db.execute('SELECT * FROM allocation WHERE order_id=?', (row['order_id'],)).fetchone()
         current = current_row['phase'] if current_row else 'deleted'
         reason = current_row['reason'] if current_row else row['reason']
         ownership, status = 'deleted', 'stopped'
         if current != 'deleted':
-            if self.vmid(row) not in self.pve.guests():
+            observed_guests = self.pve.guests() if guests is None else guests
+            if self.vmid(row) not in observed_guests:
                 ownership, current, reason = 'missing', 'missing', 'Управляемая VM отсутствует на узле'
             else:
                 try:
-                    self.owned_config(row)
-                    ownership, status = 'owned', self.pve.status(self.vmid(row))
+                    self.owned_config(row, guests, configs=configs)
+                    status = self.pve.status(self.vmid(row)) if guests is None else guests[self.vmid(row)]['status']
+                    ownership = 'owned'
                 except Refused:
                     ownership, current, reason = 'foreign', 'missing', 'VMID занят чужой VM или изменены её защищённые параметры'
         if current in ('suspended', 'blocked'):
@@ -656,12 +665,15 @@ class Engine:
                 'ssh': f'ssh -p {port} vpsadmin@{host}' if host and endpoint else None}
 
     def monitor(self):
+        # Request-local observations only; actions and readiness still read fresh state.
         guests = self.pve.guests()
+        configs = self.pve.current_configs(self.c['node'])
+        qemu_configs = {guest['vmid']: guest['config'] for guest in configs if guest['type'] == 'qemu'}
         excluded = set()
         servers = []
         rows = list(self.db.execute('SELECT * FROM allocation')) + list(self.db.execute('SELECT * FROM retired_allocation'))
         for row in rows:
-            info = self.info(row)
+            info = self.info(row, guests=guests, configs=qemu_configs)
             plan = self.c['plans'][json.loads(row['spec'])['plan']]
             metrics = dict.fromkeys(('cpuFraction', 'memoryUsedBytes', 'memoryTotalBytes', 'guestDiskUsedBytes', 'guestDiskTotalBytes'))
             if info['ownership'] == 'owned':
@@ -679,7 +691,7 @@ class Engine:
         storage = self.pve.api(f'/nodes/{self.c["node"]}/storage/{self.c["storage"]}/status')
         reserved = [v for vmid, v in guests.items() if v['node'] == self.c['node'] and not v.get('template') and vmid not in excluded]
         occupied = {r['slot'] for r in self.db.execute('SELECT slot FROM allocation')}
-        ips = declared_ips(self.pve, self.c['node'])
+        ips = declared_ips(self.pve, self.c['node'], configs=configs)
         free_slots = sum(i not in occupied and self.c['vm_first'] + i not in guests
                          and str(ipaddress.ip_address(self.c['ip_first']) + i) not in ips
                          for i in range(self.c['slots']))
@@ -688,7 +700,7 @@ class Engine:
                 'memoryReservedBytes': sum(int(v.get('maxmem', 0)) for v in reserved),
                 'vcpuReserved': sum(int(v.get('maxcpu', 0)) for v in reserved), 'storageUsedBytes': storage.get('used'),
                 'storageTotalBytes': storage['total'], 'storageFreeBytes': storage['avail'], 'slotsFree': free_slots}
-        return {'hosts': [host], 'servers': servers, 'publicIpv4': self.ipam.capacity(declared_ips(self.pve,self.c['node']))}
+        return {'hosts': [host], 'servers': servers, 'publicIpv4': self.ipam.capacity(ips)}
 
     def handle(self, request):
         require(isinstance(request, dict), 'Ожидается JSON object')

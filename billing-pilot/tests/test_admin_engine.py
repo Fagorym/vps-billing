@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -28,6 +29,10 @@ class AdminPVE(FakePVE):
 
     def guest_fs(self, vmid):
         return None
+
+    def current_configs(self, node, exclude=None):
+        return [{'vmid': vmid, 'type': config.get('_type', 'qemu'), 'config': copy.deepcopy(config)}
+                for vmid, config in self.vms.items() if vmid != exclude and node == self.c['node']]
 
     def command(self, verb, vmid, *args):
         if verb in ('shutdown', 'destroy'):
@@ -191,6 +196,74 @@ class AdminEngineTests(unittest.TestCase):
         self.assertIsNone(report['servers'][0]['metrics']['guestDiskUsedBytes'])
         self.assertNotIn('password', report['servers'][0])
         self.assertNotIn(password, json.dumps(report))
+
+    def test_monitor_reads_one_snapshot_for_all_servers(self):
+        self.e.handle({**self.request, 'action': 'create', 'order_id': 3})
+        self.pve.vms[101] = {'_type': 'lxc', 'memory': 4096, 'cores': 2,
+                             'net0': 'name=eth0,ip=10.10.10.22/24'}
+        self.pve.states[101] = 'running'
+        with patch.object(self.pve, 'guests', wraps=self.pve.guests) as resources, \
+             patch.object(self.pve, 'current_configs', wraps=self.pve.current_configs) as configs, \
+             patch.object(self.pve, 'config', side_effect=AssertionError('Per-VM config read')), \
+             patch.object(self.pve, 'status', side_effect=AssertionError('Per-VM status read')), \
+             patch.object(self.pve, 'network_configs', side_effect=AssertionError('Repeated network scan')), \
+             patch.object(self.pve, 'guest_fs', return_value=(1024, 4096)) as filesystems:
+            report = self.e.handle({'action': 'monitor'})
+        resources.assert_called_once_with()
+        configs.assert_called_once_with(self.config['node'])
+        self.assertEqual(len(report['servers']), 2)
+        self.assertTrue(all(server['ownership'] == 'owned' and server['status'] == 'running'
+                            for server in report['servers']))
+        self.assertEqual(filesystems.call_count, 2)
+        self.assertTrue(all(server['metrics']['guestDiskUsedBytes'] == 1024 for server in report['servers']))
+        self.assertEqual(report['hosts'][0]['slotsFree'], self.config['slots'] - 3)
+        self.assertEqual(report['hosts'][0]['memoryReservedBytes'], 6144 * 1048576)
+
+    def test_monitor_snapshot_preserves_ownership_and_drift_checks(self):
+        original = copy.deepcopy(self.pve.vms[1100])
+        drift = {'description': 'foreign', 'lock': 'backup', 'template': 1,
+                 'net0': 'virtio=00:00:00:00:00:00,bridge=foreign',
+                 'net1': 'virtio=00:00:00:00:00:01,bridge=vmbr1',
+                 'ipconfig0': 'ip=10.10.10.99/24,gw=10.10.10.1', 'ipconfig1': 'ip=10.10.10.99/24',
+                 'hookscript': 'local:snippets/foreign.pl', 'unused0': 'local-lvm:vm-999-disk-0',
+                 'tpmstate0': 'local-lvm:vm-1100-disk-3', 'scsi0': 'local-lvm:vm-999-disk-0',
+                 'scsi1': 'local-lvm:vm-1100-disk-3', '_type': 'lxc'}
+        for field, value in drift.items():
+            with self.subTest(field=field):
+                self.pve.vms[1100] = {**original, field: value}
+                before = list(self.pve.calls)
+                with patch.object(self.pve, 'guest_fs') as filesystems:
+                    server = self.e.handle({'action': 'monitor'})['servers'][0]
+                self.assertEqual((server['ownership'], server['phase'], server['status']),
+                                 ('foreign', 'missing', 'stopped'))
+                filesystems.assert_not_called()
+                self.assertEqual(self.pve.calls, before)
+
+    def test_monitor_snapshot_is_not_reused_by_actions_or_readiness(self):
+        self.assertEqual(self.e.handle({'action': 'monitor'})['servers'][0]['ownership'], 'owned')
+        self.pve.vms[1100]['description'] = 'foreign after monitoring'
+        before = list(self.pve.calls)
+        with self.assertRaises(engine.Refused):
+            self.admin('stop')
+        readiness = self.owner('readiness')
+        self.assertEqual(readiness['ownership'], 'foreign')
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(self.pve.calls, before)
+
+    def test_monitor_missing_and_deleted_allocations_have_no_guest_metrics(self):
+        vm = self.pve.vms.pop(1100)
+        with patch.object(self.pve, 'guest_fs') as filesystems:
+            server = self.e.handle({'action': 'monitor'})['servers'][0]
+        self.assertEqual((server['ownership'], server['phase']), ('missing', 'missing'))
+        filesystems.assert_not_called()
+        self.pve.vms[1100] = vm
+        self.admin('archive')
+        self.admin('purge', confirm_vmid=1100)
+        with patch.object(self.pve, 'guest_fs') as filesystems:
+            server = self.e.handle({'action': 'monitor'})['servers'][0]
+        self.assertEqual((server['ownership'], server['phase']), ('deleted', 'deleted'))
+        self.assertTrue(all(value is None for value in server['metrics'].values()))
+        filesystems.assert_not_called()
 
     def test_missing_and_foreign_drift_are_reported_without_recreating(self):
         del self.pve.vms[1100]
