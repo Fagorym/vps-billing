@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 import uuid
 
 
@@ -124,6 +125,25 @@ def write_guest_config(config, root=Path('/')):
     disabled.write_text('network: {config: disabled}\n')
 
 
+def wait_guest_agent(vmid):
+    deadline = time.monotonic() + 180
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise OSError('Guest agent не запустился после восстановления VM')
+        try:
+            result = subprocess.run(['/usr/sbin/qm', 'guest', 'cmd', str(vmid), 'ping'],
+                                    capture_output=True, timeout=min(10, remaining))
+            if result.returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise OSError('Guest agent не запустился после восстановления VM')
+        time.sleep(min(2, remaining))
+
+
 def apply_guest(row, lease, config):
     desired = guest_config(row, lease, config)
     # Execute reviewed host source over the agent channel. A guest-owned helper
@@ -131,6 +151,9 @@ def apply_guest(row, lease, config):
     source = Path(__file__).read_text()
     program = source + '\nwrite_guest_config(' + repr(desired) + ')\nsubprocess.run(["/usr/sbin/netplan","generate"],check=True,timeout=20)\nsubprocess.run(["/usr/sbin/netplan","apply"],check=True,timeout=30)\n'
     vmid = config['vm_first'] + row['slot']
+    # A restored VM cold-boots with the public link isolated. Wait for QGA,
+    # not public SSH: the network being repaired cannot be its prerequisite.
+    wait_guest_agent(vmid)
     result = subprocess.run(['/usr/sbin/qm','guest','exec',str(vmid),'--timeout','60','--','/usr/bin/python3','-c',program], capture_output=True, text=True, check=True, timeout=70)
     response = json.loads(result.stdout)
     if response.get('exitcode') != 0:

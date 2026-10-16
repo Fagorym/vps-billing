@@ -8,6 +8,10 @@ from test_ipam import ACCOUNT, POOL
 import json
 import unittest
 import uuid
+import subprocess
+from types import SimpleNamespace
+from unittest.mock import patch
+import guest_network
 
 class PublicEngineTests(unittest.TestCase):
     handle = fixtures.EngineTests.handle
@@ -68,6 +72,47 @@ class PublicEngineTests(unittest.TestCase):
         self.assertEqual(self.pve.status(1100), 'stopped')
         self.assertIsNone(self.handle('status')['public_ip'])
         self.assertEqual(self.e.handle({'action':'network_capacity'})['free'], 1)
+
+    def test_restore_waits_for_guest_boot_before_changing_network(self):
+        self.public_create()
+        context={'reason':'restore after cold boot','actor':{'account':ACCOUNT,'email':'operator@example.test'}}
+        self.handle('admin',command='archive',operation_id=str(uuid.uuid4()),**context)
+        probes=[]
+        def agent(args,**kwargs):
+            if args[2]=='cmd':
+                probes.append(args)
+                return SimpleNamespace(returncode=0 if len(probes)>=3 else 1)
+            if len(probes)<3:
+                raise subprocess.CalledProcessError(1,args,stderr='QEMU guest agent is not running')
+            return SimpleNamespace(stdout=json.dumps({'exitcode':0}))
+        self.pve.apply_public_network=engine.Proxmox(self.config).apply_public_network
+        with patch.object(guest_network.subprocess,'run',side_effect=agent),patch('time.sleep'):
+            restored=self.handle('admin',command='restore',operation_id=str(uuid.uuid4()),**context)
+        self.assertEqual(restored['phase'],'ready')
+        self.assertEqual(self.pve.status(1100),'running')
+        self.assertGreaterEqual(len(probes),3)
+        self.assertEqual(self.e.handle({'action':'network_capacity'})['assigned'],1)
+
+    def test_restore_boot_timeout_keeps_archive_and_releases_isolated_lease(self):
+        self.public_create()
+        context={'reason':'restore boot timeout','actor':{'account':ACCOUNT,'email':'operator@example.test'}}
+        self.handle('admin',command='archive',operation_id=str(uuid.uuid4()),**context)
+        self.pve.is_ready=False
+        calls=[]
+        def unavailable(args,**kwargs):
+            calls.append(args)
+            if args[2]=='cmd':return SimpleNamespace(returncode=1)
+            raise subprocess.CalledProcessError(1,args,stderr='QEMU guest agent is not running')
+        self.pve.apply_public_network=engine.Proxmox(self.config).apply_public_network
+        with patch.object(guest_network.subprocess,'run',side_effect=unavailable),patch('time.monotonic',side_effect=[0,0,181]),patch('time.sleep'):
+            with self.assertRaises(OSError):
+                self.handle('admin',command='restore',operation_id=str(uuid.uuid4()),**context)
+        self.assertTrue(calls)
+        self.assertTrue(all(call[2]=='cmd' for call in calls))
+        self.assertEqual(self.pve.status(1100),'stopped')
+        self.assertEqual(self.handle('status')['phase'],'archived')
+        self.assertIsNone(self.handle('status')['public_ip'])
+        self.assertEqual(self.e.handle({'action':'network_capacity'})['free'],1)
 
     def test_lost_detach_response_resumes_archive_without_leaking_lease(self):
         self.public_create()
