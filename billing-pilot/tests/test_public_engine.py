@@ -9,6 +9,7 @@ import json
 import unittest
 import uuid
 import subprocess
+import pathlib
 from types import SimpleNamespace
 from unittest.mock import patch
 import guest_network
@@ -111,6 +112,39 @@ class PublicEngineTests(unittest.TestCase):
         result=self.handle('admin',command='restore',operation_id=str(uuid.uuid4()),**context)
         self.assertEqual(result['phase'],'ready')
         self.assertEqual(self.pve.status(1100),'running')
+
+    def test_restore_uses_compact_ascii_qga_request(self):
+        self.public_create()
+        context={'reason':'restore through bounded QGA transport','actor':{'account':ACCOUNT,'email':'operator@example.test'}}
+        self.handle('admin',command='archive',operation_id=str(uuid.uuid4()),**context)
+        requests=[]
+        netplan=[]
+        guest_root=type(Path())(self.temp.name)/'guest'
+        def isolated_path(value):
+            self.assertEqual(value,'/')
+            return guest_root
+        def agent(args,**kwargs):
+            if args[0]=='/usr/sbin/netplan':
+                netplan.append(args)
+                return SimpleNamespace(returncode=0)
+            if args[2]=='cmd':return SimpleNamespace(returncode=0)
+            program=args[-1]
+            if not program.isascii() or len(program.encode())>4096:
+                raise subprocess.CalledProcessError(1,args,stderr='QGA guest-exec request timed out')
+            with patch.object(pathlib,'Path',side_effect=isolated_path):
+                exec(compile(program,'qga-request','exec'),{})
+            requests.append(program)
+            return SimpleNamespace(stdout=json.dumps({'exitcode':0}))
+        self.pve.apply_public_network=engine.Proxmox(self.config).apply_public_network
+        with patch.object(guest_network.subprocess,'run',side_effect=agent):
+            result=self.handle('admin',command='restore',operation_id=str(uuid.uuid4()),**context)
+        self.assertEqual(result['phase'],'ready')
+        self.assertEqual(len(requests),1)
+        row=self.e.db.execute('SELECT * FROM allocation WHERE order_id=1').fetchone()
+        desired=guest_network.guest_config(row,self.e.ipam.for_order(1,2),self.config)
+        self.assertEqual(json.loads((guest_root/'etc/netplan/50-cloud-init.yaml').read_text()),desired)
+        self.assertEqual((guest_root/'etc/cloud/cloud.cfg.d/99-safehost-network.cfg').read_text(),'network: {config: disabled}\n')
+        self.assertEqual(netplan,[['/usr/sbin/netplan','generate'],['/usr/sbin/netplan','apply']])
 
     def test_restore_boot_timeout_keeps_archive_and_releases_isolated_lease(self):
         self.public_create()

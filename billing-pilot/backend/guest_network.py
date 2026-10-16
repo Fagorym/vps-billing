@@ -1,4 +1,6 @@
 """Root-only bridge guards and guest-agent network changes for owned public VMs."""
+import base64
+import inspect
 import ipaddress
 import json
 import os
@@ -148,8 +150,11 @@ def apply_guest(row, lease, config):
     desired = guest_config(row, lease, config)
     # Execute reviewed host source over the agent channel. A guest-owned helper
     # is not trusted for host isolation; nft enforces the lease independently.
-    source = Path(__file__).read_text()
+    source = 'import json,subprocess\nfrom pathlib import Path\n' + inspect.getsource(write_guest_config)
     program = source + '\nwrite_guest_config(' + repr(desired) + ')\nsubprocess.run(["/usr/sbin/netplan","generate"],check=True,timeout=20)\nsubprocess.run(["/usr/sbin/netplan","apply"],check=True,timeout=30)\n'
+    # Send only the guest writer, with UTF-8 carried in an ASCII QGA argument.
+    encoded = base64.b64encode(program.encode()).decode('ascii')
+    program = 'import base64;exec(base64.b64decode(' + repr(encoded) + '))'
     vmid = config['vm_first'] + row['slot']
     # A restored VM cold-boots with the public link isolated. Wait for QGA,
     # not public SSH: the network being repaired cannot be its prerequisite.
