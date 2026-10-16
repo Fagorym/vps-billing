@@ -28,7 +28,7 @@
   "public_network": {
     "bridge": "vmbr0",
     "cidr": "45.9.88.48/28",
-    "enabled": false,
+    "enabled": true,
     "gateway": "45.9.88.49",
     "host_ip": "45.9.88.50",
     "pool_id": "selectel-spb4",

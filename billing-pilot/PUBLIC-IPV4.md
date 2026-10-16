@@ -1,6 +1,18 @@
 # Публичный IPv4: выдача и эксплуатация
 
-Код выдаёт отдельный IPv4 новой VM через сайт → FOSSBilling → root engine. Обычный NAT остаётся прежним режимом. Подсеть Selectel подключена, хост и действующие NAT endpoints перенесены. Клиентская выдача выключена до canary и утверждения цены.
+Код выдаёт отдельный IPv4 новой VM через сайт → FOSSBilling → root engine. Обычный NAT остаётся прежним режимом. Подсеть Selectel подключена, хост и действующие NAT endpoints перенесены. Canary завершена, клиентская выдача включена 16 октября 2026 за 450 ₽/мес.
+
+## Включение после canary
+
+Runtime-код engine — `a3d4953`, SHA-256 `8d46a537f89e18f20772c7d382c2b1543213de2dff498d18bf71f2e584f63c71`. Production config и его seal согласованы; `public_network.enabled:true` синхронизирован с source config и metadata FOSSBilling. Код сайта сохраняет временные базовые тарифы 10/20/30 ₽: mini с IPv4 — 460 ₽/мес. Стоимость подсети по API Selectel — 3 120 ₽/мес.; клиентских адресов 10, доплата 450 ₽ утверждена владельцем.
+
+Две отдельные тестовые VM прошли выдачу пароля и обязательную смену при первом SSH-входе, HTTP80, HTTPS443, DNS/egress с выделенного IP, изоляцию хоста/приватной сети и блокировку подмены IP. Archive освободил адрес, другая VM получила его повторно, restore вернул первой VM новый адрес, перезагрузка сохранила lease и прямой SSH. После штатного purge обеих QA VM все 10 адресов свободны; QA invoices и payment attempts сайта — 0. Все 6 прежних allocation/config/PID сохранены; отдельный NAT-заказ, появившийся параллельно, также сохранён.
+
+Canary выявила и закрыла ошибки ожидания guest agent, порядка carrier/boot, передачи QGA payload и чтения ownership marker при boot guard reload. Network capacity теперь читает конфиги через штатные `load_current_config(id,0)` QEMU/LXC одним Perl-процессом: сохраняется pending-effective поведение API. Старый и новый наборы занятых адресов на production совпали; чтение сократилось с 11,09 до 0,59 с, полный `/api/capabilities` — 0,85 с. Все 83 Python-теста прошли, включая выполнение Perl-адаптера и отказ при ошибке чтения. Независимое ревью кода, operator scripts и maintainability/style завершено без открытых замечаний.
+
+Установку совместимого read adapter выполнили атомарно под shared operation lock, исключающим изменения VM, и отдельным exclusive code-update lock. Работающие readers продолжили со старым модулем; API/worker для этой правки не останавливались. Реальная оплата нового заказа не отправлялась: на сайте проверены наличие IPv4 и неоплаченный draft 460 ₽; синтетический аккаунт удалён.
+
+Резервные копии canary/engine/allocator остаются на Proxmox в `/root/safehost-ipv4-canary-20261016/`, FOSS DB — в одноимённом root-каталоге VM101. Сайт: `/etc/safehost/ipv4-enabled-20261016/` содержит прежний env, PostgreSQL dump и подтверждение включения. Клиентские базы и секреты локально не выгружались.
 
 ## Выделенная подсеть: проверено 16 октября 2026
 
@@ -19,13 +31,13 @@
 
 Proxmox использует `45.9.88.50/28`, gateway `45.9.88.49` на `vmbr0`; `vmbr1` остаётся `10.10.10.1/24`. Проверены постоянный interfaces через `ifquery --check`, DNS и default route. Старый адрес и временная source policy route удалены после проверки нового доступа.
 
-## Состояние production после выкладки 16 октября
+## Первоначальная выкладка 16 октября
 
 Код `36bed9c7ecb1c2d361e4331b8c50bc6836aecb4b` включён в `main` и установлен: root engine, сетевые модули, FOSSBilling bridge/plugin и отдельный admin worker. Engine SHA-256: `2baeb4d4763e01104e52a0ff21a12638615814a1318e2ba408cbcefbb2a170ad`. Исходный production engine совпал с предком `d8aae1c9168f2ecf3b11c0900081825c99b0ad99`.
 
 Backup allocator/adapter и FOSSBilling/portal SQLite остаются на соответствующих серверах в `/root/safehost-release-backup-20261016/`; целостность SQLite проверена. После обновления 6 прежних allocation rows, spec/phase и VM inventory совпали с backup; установленный config и seal не менялись. Новые отдельные admin/finance tokens связаны с backend сайта; прежний клиентский token сохранён. Административный HTTPS endpoint ограничен IP сайта; проверены чтение dashboard, отказ клиентскому token и финансовый callback без создания операции.
 
-Профиль применён к sealed config штатным `network_migrate.py`. Интернет-порт `8ad31852-6cf6-556c-8f39-b5b5a99afd47` переведён с VLAN 114 на **1348**. Новый FOSSBilling URL — `https://45.9.88.50/`; доверенный IP-сертификат выпущен, staging dry-run продления прошёл. Оба backend URL сайта обновлены, отдельные tokens сохранены. Все 6 allocation rows, конфиги и PID VM совпадают с backup; снаружи проверены SSH22/2222/2223 и 22220–22225. Status worker сайта сам обновил 4 его Proxmox endpoints; прежних адресов у них нет. Пул: 10 свободно, 0 holds/leases, `enabled:false`. Canary отдельной public VM и утверждение production-цены остаются обязательными перед продажей.
+Профиль применён к sealed config штатным `network_migrate.py`. Интернет-порт `8ad31852-6cf6-556c-8f39-b5b5a99afd47` переведён с VLAN 114 на **1348**. Новый FOSSBilling URL — `https://45.9.88.50/`; доверенный IP-сертификат выпущен, staging dry-run продления прошёл. Оба backend URL сайта обновлены, отдельные tokens сохранены. Все 6 allocation rows, конфиги и PID VM совпали с backup; снаружи проверены SSH22/2222/2223 и 22220–22225. Status worker сайта сам обновил 4 его Proxmox endpoints. На этом промежуточном этапе пул оставался выключенным; итог включения после canary описан выше.
 
 ## Выполненный переход без KVM
 
@@ -62,7 +74,7 @@ Watchdog прошёл 8 unit tests и независимое ревью; race co
 | --- | --- | --- |
 | Stop / block / billing suspend | Сохраняется | Прежние правила расхода; диск сохраняется |
 | Archive | Stop → запрет onboot → удаление публичного NIC → deny guards → release | Диск бессрочно; расход остатка заморожен, автоплатежи выключены |
-| Restore | Новый hold → NIC disconnected → guest-agent netplan update → guards → connect → SSH readiness | Расход возобновляется после подтверждённого запуска; автоплатежи выключены |
+| Restore | Новый hold → NIC disconnected → guards нового lease → carrier up → boot/guest agent → netplan update → SSH readiness | Расход возобновляется после подтверждённого запуска; автоплатежи выключены |
 | Cancel / native delete | Освобождается только после остановки и изоляции | Диск сохраняется; услуга финансово завершается |
 | Purge | После подтверждённого destroy | Удаляются диски/реквизиты; сохраняется история денег/владения |
 | Missing / неизвестный эффект | Удерживается до сверки | Автоматической выдачи адреса другому заказу нет |
