@@ -51,8 +51,21 @@ final class AdminBridge
     private function locked(bool $write, callable $call): mixed
     {
         $lock = fopen($this->directory . '/operation.lock', 'c');
-        if (!$lock || !flock($lock, $write ? LOCK_EX : LOCK_SH | LOCK_NB)) { throw new RuntimeException('Bridge busy'); }
-        try { return $call(); } finally { flock($lock, LOCK_UN); fclose($lock); }
+        if (!$lock) { throw new RuntimeException('Bridge busy'); }
+        try {
+            if ($write) {
+                if (!flock($lock, LOCK_EX)) { throw new RuntimeException('Bridge busy'); }
+            } else {
+                // Profile sync and the worker briefly hold the same exclusive lock.
+                $deadline = hrtime(true) + 5_000_000_000;
+                while (!flock($lock, LOCK_SH | LOCK_NB)) {
+                    if (hrtime(true) >= $deadline) { throw new RuntimeException('Bridge busy'); }
+                    usleep(10000);
+                }
+                if (hrtime(true) >= $deadline) { throw new RuntimeException('Bridge busy'); }
+            }
+            return $call();
+        } finally { flock($lock, LOCK_UN); fclose($lock); }
     }
     public function handle(array $r): array
     {

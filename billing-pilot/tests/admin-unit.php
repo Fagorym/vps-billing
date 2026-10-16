@@ -18,6 +18,34 @@ final class AdminFakeEngine {
  public function action(array $o,string $cmd,array $r): array {$this->calls[]=$r['operationId'];$this->phase=$cmd==='archive'?'archived':($cmd==='purge'?'deleted':($cmd==='block'?'blocked':'ready'));if($this->lose){$this->lose=false;throw new RuntimeException('secret-RAW-EXCEPTION');}return [];}
  public function monitoring(): array {return ['hosts'=>[['node'=>'pve1','cpuFraction'=>0.2,'cpuCores'=>8,'memoryUsedBytes'=>100,'memoryTotalBytes'=>1000,'memoryReservedBytes'=>500,'vcpuReserved'=>2,'storageUsedBytes'=>100,'storageTotalBytes'=>1000,'storageFreeBytes'=>900,'slotsFree'=>9]],'servers'=>[['orderId'=>4,'clientId'=>1,'node'=>'pve1','phase'=>$this->phase,'status'=>'running','plan'=>'mini','vmid'=>1100,'public_ip'=>'80.249.131.4','ssh_port'=>22220,'reason'=>null,'cores'=>1,'memoryMb'=>1024,'diskGb'=>20,'createdAt'=>'2026-10-13T10:00:00+00:00','metrics'=>['cpuFraction'=>0.125,'memoryUsedBytes'=>100,'memoryTotalBytes'=>1024,'guestDiskUsedBytes'=>null,'guestDiskTotalBytes'=>null],'password'=>'NEVER-RETURN']]];}
 }
+if (($argv[1] ?? '') === 'snapshot-child') {
+ $bridge=new AdminBridge(new AdminFakeFoss(),new AdminFakeEngine(),$argv[2]);
+ echo "READY\n";fflush(STDOUT);
+ try {
+  $result=$bridge->handle(['action'=>'dashboard','actor'=>['account'=>'11111111-1111-4111-8111-111111111111','email'=>'operator@example.test'],'dayStart'=>'2026-10-13T00:00:00Z','dayEnd'=>'2026-10-14T00:00:00Z']);
+  echo $result['source'];
+ } catch(RuntimeException $e) {echo $e->getMessage();}
+ exit;
+}
+function snapshotWhileLocked(string $dir,int $mode,?int $releaseAfterMicros,bool $pauseReader=false): array {
+ $held=fopen($dir.'/operation.lock','c');flock($held,$mode);
+ $process=proc_open([PHP_BINARY,__FILE__,'snapshot-child',$dir],[['pipe','r'],['pipe','w'],['pipe','w']],$pipes);
+ fclose($pipes[0]);stream_set_timeout($pipes[1],7);
+ try {
+  adminCheck(fgets($pipes[1])==="READY\n");$started=microtime(true);
+  // Linux SIGSTOP/SIGCONT: emulate a reader descheduled past its deadline.
+  if($pauseReader){
+   $pid=proc_get_status($process)['pid'];$sleeping=false;
+   do {$sleeping=str_contains(trim(file_get_contents('/proc/'.$pid.'/wchan')),'nanosleep');if(!$sleeping)usleep(1000);}while(!$sleeping&&microtime(true)-$started<1);
+   adminCheck($sleeping&&proc_terminate($process,19));
+  }
+  if($releaseAfterMicros!==null){usleep($releaseAfterMicros);flock($held,LOCK_UN);}
+  if($pauseReader)adminCheck(proc_terminate($process,18));
+  do {$state=proc_get_status($process);if(!$state['running'])break;usleep(10000);}while(microtime(true)-$started<7);
+  if($state['running']){proc_terminate($process);throw new RuntimeException('Snapshot lock wait exceeded its deadline');}
+  return ['result'=>stream_get_contents($pipes[1]),'seconds'=>microtime(true)-$started];
+ } finally {flock($held,LOCK_UN);fclose($held);fclose($pipes[1]);fclose($pipes[2]);proc_close($process);}
+}
 $dir=sys_get_temp_dir().'/admin-'.bin2hex(random_bytes(8));$foss=new AdminFakeFoss();$engine=new AdminFakeEngine();$bridge=new AdminBridge($foss,$engine,$dir);
 $actor=['account'=>'11111111-1111-4111-8111-111111111111','email'=>'operator@example.test'];
 $profiles=[['account'=>'22222222-2222-4222-8222-222222222222','name'=>'Real User','email'=>'real@example.test','registeredAt'=>'2026-10-13T08:00:00Z'],['account'=>'33333333-3333-4333-8333-333333333333','name'=>'No VM Yet','email'=>'new@example.test','registeredAt'=>'2026-10-12T08:00:00Z']];
@@ -43,4 +71,11 @@ adminCheck(!str_contains(json_encode($bridge->handle(['action'=>'dashboard','act
 $bad=$r;$bad['operationId']='55555555-5555-4555-8555-555555555555';$bad['command']='purge';adminDenied(fn()=>$bridge->handle($bad),InvalidArgumentException::class);
 $bad=$r;$bad['actor']['account']='not-uuid';adminDenied(fn()=>$bridge->handle($bad),InvalidArgumentException::class);
 $bad=$r;$bad['reason']='x';adminDenied(fn()=>$bridge->handle($bad),InvalidArgumentException::class);
+$shared=snapshotWhileLocked($dir,LOCK_SH,null);adminCheck($shared['result']==='FOSSBilling'&&$shared['seconds']<1);
+$brief=snapshotWhileLocked($dir,LOCK_EX,200000);
+if($brief['result']!=='FOSSBilling')throw new RuntimeException('Snapshot dropped on brief lock contention: '.$brief['result']);
+adminCheck($brief['seconds']>=0.15&&$brief['seconds']<2);
+$busy=snapshotWhileLocked($dir,LOCK_EX,null);adminCheck($busy['result']==='Bridge busy'&&$busy['seconds']>=4&&$busy['seconds']<6);
+$expired=snapshotWhileLocked($dir,LOCK_EX,5100000,pauseReader:true);adminCheck($expired['result']==='Bridge busy'&&$expired['seconds']<6.5);
 echo "PASS: admin profile sync, native balance, registration stats, whitelist, durable recovery, immutable operation, actor/reason/purge gates\n";
+echo "PASS: concurrent readers, short writer contention, bounded busy deadline\n";

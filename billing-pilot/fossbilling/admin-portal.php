@@ -26,5 +26,12 @@ try {
 } catch(DomainException $e) {
     http_response_code(409); echo '{"error":"Operation or identity conflict"}';
 } catch(Throwable $e) {
+    $category = match ($e->getMessage()) {
+        'Bridge busy' => 'bridge_busy',
+        'Engine unavailable', 'Engine temporarily unavailable' => 'engine_unavailable',
+        'Invalid engine response' => 'invalid_engine_response',
+        default => get_class($e),
+    };
+    error_log('safehost-admin-unavailable: ' . $category);
     http_response_code(503); echo '{"error":"Admin service temporarily unavailable"}';
 }
