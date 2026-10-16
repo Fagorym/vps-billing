@@ -60,6 +60,8 @@ class FakePVE:
         pass
 
     def api(self, path, **params):
+        if path == '/cluster/resources' and params == {'type': 'node'}:
+            return [{'node': self.c['node'], 'status': 'online', 'cpu': 0.2}]
         if '/storage/' in path:
             return {'avail': 100 * 1073741824, 'total': 200 * 1073741824, 'used': 100 * 1073741824}
         return {'memory': {'total': 64 * 1073741824, 'used': 1073741824}, 'cpu': 0.2, 'cpuinfo': {'cpus': 8}}

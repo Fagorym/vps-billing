@@ -15,6 +15,7 @@ class AdminPVE(FakePVE):
         super().__init__(config)
         self.total_ram = 64 * 1073741824
         self.lose_destroy = False
+        self.node_resources = [{'node': config['node'], 'status': 'online', 'cpu': 0.125}]
 
     def guests(self):
         return {vmid: {**guest, 'maxmem': int(self.vms[vmid].get('memory', 0)) * 1048576,
@@ -23,9 +24,11 @@ class AdminPVE(FakePVE):
                 for vmid, guest in super().guests().items()}
 
     def api(self, path, **params):
+        if path == '/cluster/resources' and params == {'type': 'node'}:
+            return copy.deepcopy(self.node_resources)
         if path.endswith('/storage/local-lvm/status'):
             return {'avail': 100 * 1073741824, 'total': 200 * 1073741824, 'used': 100 * 1073741824}
-        return {'memory': {'total': self.total_ram, 'used': 1073741824}, 'cpu': 0.2, 'cpuinfo': {'cpus': 8}}
+        return {'memory': {'total': self.total_ram, 'used': 1073741824}, 'cpu': 0, 'cpuinfo': {'cpus': 8}}
 
     def guest_fs(self, vmid):
         return None
@@ -196,6 +199,29 @@ class AdminEngineTests(unittest.TestCase):
         self.assertIsNone(report['servers'][0]['metrics']['guestDiskUsedBytes'])
         self.assertNotIn('password', report['servers'][0])
         self.assertNotIn(password, json.dumps(report))
+
+    def test_monitor_uses_background_cpu_sample_for_the_configured_node(self):
+        self.pve.node_resources.insert(0, {'node': 'other-node', 'status': 'online', 'cpu': 0.9})
+        report = self.e.handle({'action': 'monitor'})
+        self.assertEqual(report['hosts'][0]['cpuFraction'], 0.125)
+
+    def test_monitor_preserves_a_real_zero_cpu_sample(self):
+        self.pve.node_resources[0]['cpu'] = 0
+        self.assertEqual(self.e.handle({'action': 'monitor'})['hosts'][0]['cpuFraction'], 0)
+
+    def test_monitor_does_not_report_zero_when_node_cpu_is_unavailable(self):
+        observations = (
+            [],
+            [{'node': 'other-node', 'status': 'online', 'cpu': 0.9}],
+            [{'node': self.config['node'], 'status': 'offline', 'cpu': 0.1}],
+            [{'node': self.config['node'], 'status': 'online'}],
+        )
+        for resources in observations:
+            with self.subTest(resources=resources):
+                self.pve.node_resources = resources
+                report = self.e.handle({'action': 'monitor'})
+                self.assertIsNone(report['hosts'][0]['cpuFraction'])
+                self.assertEqual(report['hosts'][0]['memoryTotalBytes'], self.pve.total_ram)
 
     def test_monitor_reads_one_snapshot_for_all_servers(self):
         self.e.handle({**self.request, 'action': 'create', 'order_id': 3})

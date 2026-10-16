@@ -688,6 +688,11 @@ class Engine:
                             'plan': json.loads(row['spec'])['plan'], 'cores': plan['cores'], 'memoryMb': plan['memory_mb'],
                             'diskGb': plan['disk_gb'], 'createdAt': row['created_at'], 'metrics': metrics})
         node = self.pve.api(f'/nodes/{self.c["node"]}/status')
+        # A fresh pvesh process has no previous CPU sample and reports zero.
+        # Cluster resources contain the interval measured by pvestatd instead.
+        node_samples = self.pve.api('/cluster/resources', type='node')
+        node_sample = next((sample for sample in node_samples
+                            if sample.get('node') == self.c['node'] and sample.get('status') == 'online'), {})
         storage = self.pve.api(f'/nodes/{self.c["node"]}/storage/{self.c["storage"]}/status')
         reserved = [v for vmid, v in guests.items() if v['node'] == self.c['node'] and not v.get('template') and vmid not in excluded]
         occupied = {r['slot'] for r in self.db.execute('SELECT slot FROM allocation')}
@@ -695,7 +700,7 @@ class Engine:
         free_slots = sum(i not in occupied and self.c['vm_first'] + i not in guests
                          and str(ipaddress.ip_address(self.c['ip_first']) + i) not in ips
                          for i in range(self.c['slots']))
-        host = {'node': self.c['node'], 'cpuFraction': node.get('cpu'), 'cpuCores': node.get('cpuinfo', {}).get('cpus'),
+        host = {'node': self.c['node'], 'cpuFraction': node_sample.get('cpu'), 'cpuCores': node.get('cpuinfo', {}).get('cpus'),
                 'memoryUsedBytes': node['memory']['used'], 'memoryTotalBytes': node['memory']['total'],
                 'memoryReservedBytes': sum(int(v.get('maxmem', 0)) for v in reserved),
                 'vcpuReserved': sum(int(v.get('maxcpu', 0)) for v in reserved), 'storageUsedBytes': storage.get('used'),
