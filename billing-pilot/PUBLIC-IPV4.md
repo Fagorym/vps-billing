@@ -19,6 +19,14 @@
 
 Read-only SSH подтвердил, что Proxmox пока использует `80.249.131.4/24`, gateway `80.249.131.1` на `vmbr0`, а `vmbr1` остаётся `10.10.10.1/24`. Эти наблюдения не означают, что переход уже выполнен. До изменения uplink должны работать резервная консоль и доступ к серверу сайта для смены FOSS endpoint; иначе действующие VPS потеряют связь с кабинетом.
 
+## Состояние production после выкладки 16 октября
+
+Код `36bed9c7ecb1c2d361e4331b8c50bc6836aecb4b` включён в `main` и установлен: root engine, сетевые модули, FOSSBilling bridge/plugin и отдельный admin worker. Engine SHA-256: `2baeb4d4763e01104e52a0ff21a12638615814a1318e2ba408cbcefbb2a170ad`. Исходный production engine совпал с предком `d8aae1c9168f2ecf3b11c0900081825c99b0ad99`.
+
+Backup allocator/adapter и FOSSBilling/portal SQLite остаются на соответствующих серверах в `/root/safehost-release-backup-20261016/`; целостность SQLite проверена. После обновления 6 прежних allocation rows, spec/phase и VM inventory совпали с backup; установленный config и seal не менялись. Новые отдельные admin/finance tokens связаны с backend сайта; прежний клиентский token сохранён. Административный HTTPS endpoint ограничен IP сайта; проверены чтение dashboard, отказ клиентскому token и финансовый callback без создания операции.
+
+Профиль подсети находится в Git, **к sealed config пока не применён**. Активный адрес остаётся `80.249.131.4`, public выдача выключена. У server resource `28fec6a3-6a7e-4e96-b414-8387a3b79534` API возвращает `console_enabled:false`; запрос KVM — `500 C00001 BadRequest / Internal error`. Физический VLAN/IP cutover и canary отложены до рабочего резервного доступа; новые адреса пока не продаются.
+
 ## Что хранится где
 
 - Сайт: аккаунт, исходный checkout, подтверждённая оплата, immutable цена и UUID резерва. ЮKassa остаётся платёжным провайдером сайта.
