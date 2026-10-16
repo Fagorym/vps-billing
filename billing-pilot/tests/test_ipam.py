@@ -1,6 +1,8 @@
 """Behavioral lease tests: no duplicates, stale owners, or timed-out payments."""
 import concurrent.futures
+from contextlib import closing
 import importlib.util
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -39,6 +41,18 @@ class IpamTests(unittest.TestCase):
             self.ipam.reserve(ACCOUNT, str(uuid.uuid4()))
         with self.assertRaises(ValueError):
             self.ipam.reserve(str(uuid.uuid4()), self.ref)
+
+    def test_allocated_selectel_pool_excludes_host_gateway_and_vrrp(self):
+        patch = json.loads((ROOT / "networks/selectel-spb4-45.9.88.48-28.json").read_text())
+        with closing(sqlite3.connect(':memory:')) as fresh:
+            fresh.row_factory = sqlite3.Row
+            allocator = self.module.Ipam(fresh, patch['public_network'])
+            self.assertEqual(allocator.addresses, [f'45.9.88.{last}' for last in range(51, 61)])
+            self.assertEqual(allocator.capacity()['free'], 10)
+            self.assertFalse(allocator.capacity()['enabled'])
+            self.assertEqual(patch['public_ip'], patch['public_network']['host_ip'])
+            with self.assertRaises(ValueError):
+                allocator.reserve(ACCOUNT, self.ref)
 
     def test_only_one_concurrent_buyer_gets_last_address(self):
         def reserve(_):

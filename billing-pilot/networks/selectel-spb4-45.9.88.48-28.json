@@ -1,0 +1,12 @@
+{
+  "public_ip": "45.9.88.50",
+  "public_network": {
+    "enabled": false,
+    "pool_id": "selectel-spb4",
+    "cidr": "45.9.88.48/28",
+    "gateway": "45.9.88.49",
+    "bridge": "vmbr0",
+    "host_ip": "45.9.88.50",
+    "reserved": ["45.9.88.61", "45.9.88.62"]
+  }
+}
