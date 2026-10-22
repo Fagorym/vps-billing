@@ -22,6 +22,9 @@ from cryptography.fernet import Fernet, InvalidToken
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ipam import Ipam, Refused as IpamRefused
 
+DEFAULT_OS = 'Ubuntu 24.04'
+SUPPORTED_OS = (DEFAULT_OS, 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13')
+
 
 class Refused(ValueError):
     pass
@@ -30,6 +33,12 @@ class Refused(ValueError):
 def require(condition, message):
     if not condition:
         raise Refused(message)
+
+
+def selected_os(value):
+    name = DEFAULT_OS if value is None else value
+    require(isinstance(name, str) and name in SUPPORTED_OS, 'Неизвестная операционная система')
+    return name
 
 
 def ssh_key(value):
@@ -235,6 +244,24 @@ class Engine:
     def vmid(self, row):
         return self.c['vm_first'] + row['slot']
 
+    def template(self, os_name):
+        templates = self.c.get('templates', {})
+        require(isinstance(templates, dict), 'Некорректный каталог шаблонов ОС')
+        configured = templates.get(os_name)
+        if os_name not in templates and os_name == DEFAULT_OS:
+            configured = {key: self.c.get(key) for key in ('template_id', 'template_marker')}
+        require(isinstance(configured, dict), 'Шаблон выбранной ОС ещё не настроен')
+        template_id, marker = configured.get('template_id'), configured.get('template_marker')
+        require(type(template_id) is int and template_id > 0 and isinstance(marker, str) and marker.strip(),
+                'Некорректная конфигурация шаблона ОС')
+        guest = self.pve.guests().get(template_id)
+        require(guest is not None and guest['node'] == self.c['node'] and guest['type'] == 'qemu',
+                'Шаблон выбранной ОС не найден на заданном узле')
+        template = self.pve.config(template_id)
+        require(template.get('template') and template.get('description') == marker and not template.get('lock'),
+                'Шаблон ОС не принадлежит proxmox-pilot или заблокирован')
+        return template_id
+
     def owned_config(self, row, guests=None, *, configs=None):
         vmid = self.vmid(row)
         guest = (guests if guests is not None else self.pve.guests()).get(vmid)
@@ -338,6 +365,8 @@ class Engine:
             require(row['client_id'] == client and json.loads(row['spec']) == spec,
                     'Заказ уже закреплён за другим клиентом, тарифом или SSH-ключом')
             return row
+        # Refuse an unavailable/unowned OS before allocating a slot or a password.
+        self.template(spec.get('os', DEFAULT_OS))
         used = {r[0] for r in self.db.execute('SELECT slot FROM allocation')}
         guests = self.pve.guests()
         ips = declared_ips(self.pve, self.c['node'])
@@ -578,11 +607,9 @@ class Engine:
             require(row['phase'] == 'reserved', 'Ранее созданная VM исчезла; автоматическое восстановление запрещено')
             ip = str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])
             require(ip not in declared_ips(self.pve, self.c['node']), 'IP закреплённого слота занят другой VM или LXC')
-            template = self.pve.config(self.c['template_id'])
-            require(template.get('template') and template.get('description') == self.c['template_marker'],
-                    'Шаблон не принадлежит proxmox-pilot')
+            template_id = self.template(spec.get('os', DEFAULT_OS))
             self.capacity(plan)
-            self.pve.command('clone', self.c['template_id'], vmid, '--full', '1', '--storage', self.c['storage'],
+            self.pve.command('clone', template_id, vmid, '--full', '1', '--storage', self.c['storage'],
                              '--name', f'vps-order-{row["order_id"]}', '--description', self.marker(row))
         cfg = self.owned_config(row)
         if not row['created_at'] and row['phase'] == 'reserved':
@@ -603,9 +630,12 @@ class Engine:
             credential = self.db.execute('SELECT password_hash FROM credential WHERE order_id=?', (row['order_id'],)).fetchone()
             require(credential is not None, 'Не найден пароль закреплённого VPS; нужна проверка администратором')
             del cloud['users'][0]['ssh_authorized_keys']
-            # Ubuntu's set_passwords runs before SSH, and expires the hash before enabling password auth.
+            # Cloud-init sets and expires the password before enabling SSH password auth.
             cloud['chpasswd'] = {'expire': True, 'users': [
                 {'name': 'vpsadmin', 'type': 'hash', 'password': credential['password_hash']}]}
+            # Ubuntu 22.04 cloud-init may exclude hashed users from expire=true.
+            # Enforce expiry before cloud-init can report this guest ready.
+            cloud['runcmd'].insert(0, ['chage', '-d', '0', 'vpsadmin'])
             cloud['ssh_pwauth'] = True
             cloud['write_files'] = [{'path': '/etc/ssh/sshd_config.d/00-safehost-password.conf',
                                      'owner': 'root:root', 'permissions': '0644',
@@ -726,6 +756,7 @@ class Engine:
                 if action == 'network_capacity':
                     return self.ipam.capacity(declared_ips(self.pve, self.c['node']))
                 if action == 'network_reserve':
+                    self.template(selected_os(request.get('os')))
                     return self.ipam.reserve(request.get('account'), request.get('reference'), declared_ips(self.pve, self.c['node']))
                 if action == 'network_payment_pending':
                     return self.ipam.payment_pending(request.get('account'), request.get('reference'), request.get('lease_id'))
@@ -740,10 +771,14 @@ class Engine:
         require(type(order) is int and 1 <= order < 2147483647 and type(client) is int and 1 <= client < 2147483647,
                 'Нужны целочисленные order_id и client_id')
         if action == 'create':
+            os_name = selected_os(request.get('os'))
             require(request.get('plan') in self.c['plans'], 'Неизвестный тариф')
             key = request.get('ssh_key', '')
             require(key is None or isinstance(key, str), 'Некорректный публичный SSH-ключ')
             spec = {'plan': request['plan'], 'ssh_key': ssh_key(key) if key and key.strip() else None}
+            # Preserve the historical default spec JSON and its ownership fingerprint.
+            if os_name != DEFAULT_OS:
+                spec['os'] = os_name
             requested_disk = request.get('disk_gb')
             if requested_disk is not None:
                 spec['disk_gb'] = requested_disk
@@ -812,7 +847,6 @@ class Engine:
 def main():
     os.umask(0o077)
     # SSH_ORIGINAL_COMMAND is deliberately ignored. stdin is the only protocol.
-    config = json.loads(Path('/etc/safehost-billing/config.json').read_text())
     state = Path('/var/lib/safehost-billing')
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     raw = sys.stdin.buffer.read(8193)
@@ -825,6 +859,8 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB if read_only else fcntl.LOCK_EX)
         except BlockingIOError as exc:
             raise Refused('Выполняется изменение VPS; повторите запрос') from exc
+        # Config and its seal are replaced under this same lock during migrations.
+        config = json.loads(Path('/etc/safehost-billing/config.json').read_text())
         engine = Engine(config, state, '/var/lib/vz/snippets')
         try:
             result = engine.handle(request)

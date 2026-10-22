@@ -35,6 +35,41 @@ class PublicEngineTests(unittest.TestCase):
     def reserve_ip(self):
         return self.e.handle({'action':'network_reserve', **self.network})
 
+    def test_invalid_or_unavailable_os_cannot_hold_public_ipv4(self):
+        for os_name in ('Debian 12', 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13', '', 13):
+            with self.subTest(os=os_name), self.assertRaises(engine.Refused):
+                self.e.handle({'action': 'network_reserve', 'os': os_name, **self.network})
+        self.assertEqual(self.e.handle({'action': 'network_capacity'})['held'], 0)
+        self.assertEqual(self.e.db.execute('SELECT count(*) FROM allocation').fetchone()[0], 0)
+        fixtures.EngineTests.add_os_templates(self)
+        self.pve.vms[9003]['description'] = 'foreign'
+        with self.assertRaises(engine.Refused):
+            self.e.handle({'action': 'network_reserve', 'os': 'Debian 13', **self.network})
+        self.assertEqual(self.e.handle({'action': 'network_capacity'})['held'], 0)
+
+    def test_public_debian_clone_and_replay_keep_guard_and_frozen_os(self):
+        fixtures.EngineTests.add_os_templates(self)
+        guarded = []
+        self.pve.network_guard = lambda row, lease, config: guarded.append((row['order_id'], lease['id']))
+        lease = self.e.handle({'action': 'network_reserve', 'os': 'Debian 13', **self.network})
+        request = {'network_mode': 'public_ipv4', 'lease_id': lease['id'], 'os': 'Debian 13', **self.network}
+        first = self.handle('create', **request)
+        self.assertEqual(guarded, [(1, lease['id'])])
+        self.assertEqual([call[1] for call in self.pve.calls if call[0] == 'clone'], [9003])
+        calls = list(self.pve.calls)
+        self.assertEqual(self.handle('create', **request), first)
+        with self.assertRaises(engine.Refused):
+            self.handle('create', **{**request, 'os': 'Ubuntu 24.04'})
+        self.assertEqual(self.pve.calls, calls)
+        self.assertEqual(self.e.handle({'action': 'network_capacity'})['assigned'], 1)
+        del self.pve.vms[9003]
+        context = {'reason': 'Debian network restore', 'actor': {'account': ACCOUNT, 'email': 'operator@example.test'}}
+        self.handle('admin', command='archive', operation_id=str(uuid.uuid4()), **context)
+        restored = self.handle('admin', command='restore', operation_id=str(uuid.uuid4()), **context)
+        self.assertEqual((restored['phase'], restored['vmid']), ('ready', first['vmid']))
+        self.assertEqual(json.loads(self.e.db.execute('SELECT spec FROM allocation').fetchone()[0])['os'], 'Debian 13')
+        self.assertEqual([call[1] for call in self.pve.calls if call[0] == 'clone'], [9003])
+
     def test_native_capacity_reads_canonical_network_configs_in_one_process(self):
         configs=[{'type':'qemu','config':{'ipconfig0':'ip=198.51.100.3/29','net0':'ip=198.51.100.8/29'}},
                  {'type':'lxc','config':{'net0':'name=eth0,ip=198.51.100.4/29','ipconfig0':'ip=198.51.100.9/29'}}]

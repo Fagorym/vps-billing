@@ -273,6 +273,7 @@ def main():
         if args.action == 'test':
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/portal-unit.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/public-portal-unit.php', demo=True)
+            compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/adapter-unit.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/admin-unit.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/finance-unit.php', demo=True)
             compose('exec', '-T', '--user', '33:33', 'billing', 'php', '/tests/e2e.php', demo=True)

@@ -21,6 +21,13 @@ final class PortalBridge
             if (!in_array('disk_gb',$columns,true)) { $this->db->exec('ALTER TABLE '.$table.' ADD COLUMN disk_gb INTEGER'); }
         }
         $this->allowMultipleOrders();
+        // Run after the legacy account-quota migration, whose schema is exact.
+        foreach (['orders', 'retired_orders'] as $table) {
+            $columns = $this->db->query('PRAGMA table_info('.$table.')')->fetchAll(PDO::FETCH_COLUMN, 1);
+            if (!in_array('os', $columns, true)) {
+                $this->db->exec("ALTER TABLE ".$table." ADD COLUMN os TEXT NOT NULL DEFAULT 'Ubuntu 24.04'");
+            }
+        }
         chmod($directory . '/portal.sqlite', 0600);
         file_put_contents($directory . '/.htaccess', "Require all denied\n");
     }
@@ -86,8 +93,14 @@ final class PortalBridge
         if (!in_array($r['action'] ?? '', ['create', 'status', 'password', 'start', 'stop', 'network_capacity','network_reserve','network_payment_pending','network_release_hold'], true)) {
             throw new InvalidArgumentException('Invalid action');
         }
+        $os = $r['os'] ?? 'Ubuntu 24.04';
+        if (in_array($r['action'], ['create', 'network_reserve'], true)
+            && !in_array($os, ['Ubuntu 24.04', 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13'], true)) {
+            throw new InvalidArgumentException('Invalid operating system');
+        }
         if (str_starts_with($r['action'],'network_')) {
             $payload=['action'=>$r['action'],'account'=>$r['account'],'reference'=>$r['reference']];
+            if ($r['action'] === 'network_reserve') { $payload['os'] = $os; }
             if(in_array($r['action'],['network_payment_pending','network_release_hold'],true)) {
                 if(!is_string($r['lease_id']??null)||!preg_match('/^[0-9a-f-]{36}$/D',$r['lease_id']))throw new InvalidArgumentException('Invalid lease identity');
                 $payload['lease_id']=$r['lease_id'];
@@ -104,6 +117,7 @@ final class PortalBridge
             $row = $this->row('SELECT * FROM orders WHERE reference=?', [$r['reference']]);
             if (!$row) { $row = $this->row('SELECT * FROM retired_orders WHERE reference=?', [$r['reference']]); }
             if ($r['action'] === 'create') {
+                if ($row && $row['os'] !== $os) { throw new DomainException('Operating system reference conflict'); }
                 if (!in_array($r['plan'] ?? '', ['mini', 'small', 'medium'], true)) { throw new InvalidArgumentException('Invalid plan'); }
                 [$baseDisk, $maximumDisk] = ['mini'=>[20,40], 'small'=>[50,80], 'medium'=>[80,120]][$r['plan']];
                 $disk = $r['disk_gb'] ?? $baseDisk;
@@ -117,7 +131,8 @@ final class PortalBridge
                 if($row&&($row['network_mode']!==$mode||$mode==='public_ipv4'&&$row['lease_id']!==$r['lease_id']))throw new DomainException('Network reference conflict');
                 if ($row && ($row['account'] !== $r['account'] || $row['plan'] !== $r['plan'])) { throw new DomainException('Reference conflict'); }
                 if (!$row) {
-                    $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id,disk_gb) VALUES(?,?,?,?,?,?)', [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null, $disk]);
+                    $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id,disk_gb,os) VALUES(?,?,?,?,?,?,?)',
+                        [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null, $disk, $os]);
                     $row = $this->row('SELECT * FROM orders WHERE reference=?', [$r['reference']]);
                 }
             }
@@ -132,7 +147,11 @@ final class PortalBridge
             $clientId = (int) $client['client_id'];
             if (!$row['order_id']) {
                 if ($r['action'] !== 'create') { throw new OutOfBoundsException('Order not found'); }
-                $id = $this->foss->order($clientId, $r['reference'], $row['plan'], ['disk_gb'=>$row['disk_gb'] === null ? null : (int) $row['disk_gb'], 'network_mode'=>$row['network_mode'],'lease_id'=>$row['lease_id'],'account'=>$r['account'],'reference'=>$r['reference']]);
+                $id = $this->foss->order($clientId, $r['reference'], $row['plan'], [
+                    'disk_gb'=>$row['disk_gb'] === null ? null : (int) $row['disk_gb'],
+                    'network_mode'=>$row['network_mode'], 'lease_id'=>$row['lease_id'],
+                    'account'=>$r['account'], 'reference'=>$r['reference'], 'os'=>$row['os'],
+                ]);
                 $this->write('UPDATE orders SET order_id=? WHERE reference=?', [$id, $r['reference']]);
                 $row['order_id'] = $id;
             }
@@ -195,7 +214,7 @@ final class FossPortal
             return (int) $existing->id;
         }
         return (int) $this->api->order_create(['client_id' => $client, 'product_id' => $product, 'period' => '1M',
-            'title' => $title, 'config' => array_merge(['ssh_key' => ''],$network), 'price' => 0, 'invoice_option' => 'no-invoice', 'activate' => false]);
+            'title' => $title, 'config' => array_merge(['ssh_key' => '', 'os' => 'Ubuntu 24.04'],$network), 'price' => 0, 'invoice_option' => 'no-invoice', 'activate' => false]);
     }
     public function network(array $request): array
     {

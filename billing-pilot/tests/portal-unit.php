@@ -5,12 +5,14 @@ function assertPortal(bool $condition): void { if (!$condition) { throw new Runt
 final class FakeFoss {
  public int $clients=0; public int $orders=0; public int $activations=0; public bool $lose=true; public bool $ready=true;
  public array $calls=[];
+ public array $configs=[];
  public string $power='running';public array $ownerCalls=[];
  public array $phases=[];
  private array $clientIds=[]; private array $orderIds=[]; private array $records=[];
  public function client(string $account): int { return $this->clientIds[$account] ??= ++$this->clients; }
- public function order(int $client,string $reference,string $plan): int {
+ public function order(int $client,string $reference,string $plan,array $config=[]): int {
   $id=$this->orderIds[$reference] ??= ++$this->orders;
+  $this->configs[$id]=$config;
   $this->records[$id] ??= ['client_id'=>$client,'status'=>'pending_setup'];
   if($this->lose){$this->lose=false;throw new RuntimeException('Lost order response');}return $id;
  }
@@ -82,9 +84,35 @@ $legacy->exec("INSERT INTO retired_orders VALUES('33333333-3333-4333-8333-333333
 $before=$legacy->query('SELECT * FROM orders')->fetchAll(PDO::FETCH_ASSOC);$retired=$legacy->query('SELECT * FROM retired_orders')->fetchAll(PDO::FETCH_ASSOC);
 $migratedFoss=new FakeFoss();$migratedFoss->lose=false;$client=$migratedFoss->client($account);$native=$migratedFoss->order($client,$reference,'mini');$migratedFoss->activate($native);
 $migrated=new PortalBridge($migratedFoss,$legacyDir);$migrated=new PortalBridge($migratedFoss,$legacyDir);
-assertPortal($legacy->query('SELECT * FROM orders')->fetchAll(PDO::FETCH_ASSOC)===$before);
-assertPortal($legacy->query('SELECT * FROM retired_orders')->fetchAll(PDO::FETCH_ASSOC)===$retired);
+assertPortal($legacy->query('SELECT reference,account,plan,order_id,network_mode,lease_id,disk_gb FROM orders')->fetchAll(PDO::FETCH_ASSOC)===$before);
+assertPortal($legacy->query('SELECT reference,account,plan,order_id,network_mode,lease_id,disk_gb FROM retired_orders')->fetchAll(PDO::FETCH_ASSOC)===$retired);
+assertPortal($legacy->query('SELECT os FROM orders')->fetchColumn()==='Ubuntu 24.04');
+assertPortal($legacy->query('SELECT os FROM retired_orders')->fetchColumn()==='Ubuntu 24.04');
 $existing=['account'=>$account,'reference'=>$reference,'action'=>'create','plan'=>'mini'];assertPortal($migrated->handle($existing)['order_id']===1);
 $new=$existing;$new['reference']='44444444-4444-4444-8444-444444444444';assertPortal($migrated->handle($new)['order_id']===2);
 assertPortal($migrated->handle($existing)['order_id']===1&&$migratedFoss->clients===1&&$migratedFoss->orders===2);
-echo "PASS: portal durable recovery, immutable identity, multiple VPS, ownership, readiness, password isolation\n";
+assertPortal($migrated->handle($existing+['os'=>'Ubuntu 24.04'])['order_id']===1);
+denied(fn()=>$migrated->handle($existing+['os'=>'Debian 13']),DomainException::class);
+// OS is frozen in the durable reservation even if the native order reply is lost.
+$osDir=sys_get_temp_dir().'/portal-os-'.bin2hex(random_bytes(6));$osFoss=new FakeFoss();$osBridge=new PortalBridge($osFoss,$osDir);
+$osRequest=['action'=>'create','account'=>$account,'reference'=>$reference,'plan'=>'mini','os'=>'Debian 13'];
+denied(fn()=>$osBridge->handle($osRequest),RuntimeException::class);
+denied(fn()=>$osBridge->handle(array_merge($osRequest,['os'=>'Ubuntu 24.04'])),DomainException::class);
+assertPortal($osFoss->orders===1&&$osFoss->activations===0);
+$created=$osBridge->handle($osRequest);assertPortal($created===$osBridge->handle($osRequest));
+assertPortal($osFoss->configs[1]===['disk_gb'=>20,'network_mode'=>'nat','lease_id'=>null,'account'=>$account,'reference'=>$reference,'os'=>'Debian 13']);
+foreach(['Ubuntu 24.04','Ubuntu 22.04','Ubuntu 26.04','Debian 13'] as $index=>$os){
+ $reference=sprintf('77777777-7777-4777-8777-%012d',$index);
+ $request=array_merge($osRequest,['reference'=>$reference,'os'=>$os]);$created=$osBridge->handle($request);
+ assertPortal($osFoss->configs[$created['order_id']]['os']===$os&&$created===$osBridge->handle($request));
+}
+$orders=$osFoss->orders;$activations=$osFoss->activations;
+foreach(['Ubuntu 20.04','',13,[]] as $os)denied(fn()=>$osBridge->handle(array_merge($osRequest,['os'=>$os])),InvalidArgumentException::class);
+denied(fn()=>$osBridge->handle(array_diff_key($osRequest,['os'=>true])),DomainException::class);
+$osDb=new PDO('sqlite:'.$osDir.'/portal.sqlite');
+$osDb->exec("INSERT INTO retired_orders SELECT * FROM orders WHERE os='Debian 13'");
+$osDb->exec("DELETE FROM orders WHERE os='Debian 13'");
+denied(fn()=>$osBridge->handle(array_merge($osRequest,['os'=>'Ubuntu 24.04'])),DomainException::class);
+assertPortal($osBridge->handle($osRequest)['order_id']===1);
+assertPortal($osFoss->orders===$orders&&$osFoss->activations===$activations);
+echo "PASS: portal durable recovery, immutable OS and identity, legacy migration, multiple VPS, ownership, password isolation\n";

@@ -4,7 +4,8 @@ declare(strict_types=1);
 /** FOSSBilling 0.8.8 Custom product plugin. Credentials never come from order data. */
 class SafehostProxmox
 {
-    public function __construct(private array $config = []) {}
+    public function __construct(private array $config = [], private ?FinanceLifecycle $financeLifecycle = null,
+        private ?Closure $transport = null) {}
 
     public function activate(array $data, array $order, array $params = []): bool
     {
@@ -13,6 +14,7 @@ class SafehostProxmox
         $this->request('create', $order, [
             'plan' => $this->config['plan'] ?? '',
             'disk_gb' => $data['disk_gb'] ?? null,
+            'os' => $data['os'] ?? 'Ubuntu 24.04',
             'ssh_key' => $data['ssh_key'] ?? '',
             'network_mode'=>$data['network_mode']??'nat', 'lease_id'=>$data['lease_id']??null,
             'account'=>$data['account']??null,'reference'=>$data['reference']??null,
@@ -93,7 +95,7 @@ class SafehostProxmox
     }
     private function finance(): FinanceLifecycle
     {
-        require_once '/opt/pilot/FinanceLifecycle.php';return FinanceLifecycle::runtime();
+        require_once '/opt/pilot/FinanceLifecycle.php';return $this->financeLifecycle ?? FinanceLifecycle::runtime();
     }
 
     private function request(string $action, array $order, array $extra = []): array
@@ -103,6 +105,7 @@ class SafehostProxmox
             'order_id' => (int) $order['id'],
             'client_id' => (int) $order['client_id'],
         ]);
+        if ($this->transport !== null) { return ($this->transport)($payload); }
         $argv = ['/usr/bin/ssh', '-T', '-i', '/run/proxmox/id_ed25519',
             '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
             '-o', 'UserKnownHostsFile=/run/proxmox/known_hosts', '-o', 'ConnectTimeout=10',

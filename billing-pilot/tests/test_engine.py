@@ -105,6 +105,49 @@ class FakePVE:
 
 
 class CLILockingContracts(unittest.TestCase):
+    def test_waiting_mutation_loads_config_after_acquiring_the_command_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = root / 'config.json'
+            config.write_text('{"generation":"before"}')
+            state = root / 'state'
+            state.mkdir()
+            attempted = threading.Event()
+            observed = []
+            failures = []
+            original_flock = fcntl.flock
+            def flock(file, mode):
+                if threading.current_thread() is not threading.main_thread():
+                    attempted.set()
+                return original_flock(file, mode)
+            def path(value):
+                return config if value == '/etc/safehost-billing/config.json' else state if value == '/var/lib/safehost-billing' else Path(value)
+            def create_engine(current_config, *args):
+                observed.append(current_config)
+                return SimpleNamespace(db=SimpleNamespace(close=lambda: None), handle=lambda request: {'status': 'stopped'})
+            def invoke():
+                try:
+                    engine.main()
+                except BaseException as error:
+                    failures.append(error)
+            with (state / 'operation.lock').open('a') as held:
+                original_flock(held, fcntl.LOCK_SH)
+                with patch.object(engine, 'Path', side_effect=path), patch.object(engine, 'Engine', side_effect=create_engine), \
+                     patch.object(engine.fcntl, 'flock', side_effect=flock), \
+                     patch.object(engine.sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(b'{"action":"suspend"}'))), \
+                     patch.object(engine.sys, 'stdout', io.StringIO()):
+                    task = threading.Thread(target=invoke, daemon=True)
+                    task.start()
+                    try:
+                        self.assertTrue(attempted.wait(timeout=2))
+                        config.write_text('{"generation":"after"}')
+                    finally:
+                        original_flock(held, fcntl.LOCK_UN)
+                        task.join(timeout=2)
+                    self.assertFalse(task.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(observed, [{'generation': 'after'}])
+
     def invoke_while_locked(self, held_mode, action):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -192,6 +235,101 @@ class EngineTests(unittest.TestCase):
 
     def handle(self, action, **kwargs):
         return self.e.handle({**self.req, 'action': action, **kwargs})
+
+    def add_os_templates(self):
+        self.config['templates'] = {}
+        for template_id, os_name in enumerate(('Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13'), 9001):
+            marker = f'proxmox-pilot:v1:template:test-{template_id}'
+            self.config['templates'][os_name] = {'template_id': template_id, 'template_marker': marker}
+            self.pve.vms[template_id] = {**self.pve.vms[9000], 'description': marker}
+            self.pve.states[template_id] = 'stopped'
+
+    def test_selected_os_clones_its_owned_template_and_freezes_spec(self):
+        self.add_os_templates()
+        for order, os_name, template_id in ((1, 'Ubuntu 24.04', 9000), (2, 'Ubuntu 22.04', 9001),
+                                             (3, 'Ubuntu 26.04', 9002), (4, 'Debian 13', 9003)):
+            with self.subTest(os=os_name):
+                first = self.handle('create', order_id=order, os=os_name, disk_gb=25)
+                row = self.e.db.execute('SELECT * FROM allocation WHERE order_id=?', (order,)).fetchone()
+                expected_spec = {'plan': 'mini', 'ssh_key': KEY, 'disk_gb': 25}
+                if os_name != 'Ubuntu 24.04':
+                    expected_spec['os'] = os_name
+                self.assertEqual(json.loads(row['spec']), expected_spec)
+                self.assertIn(('clone', template_id, first['vmid'], '--full', '1', '--storage', self.config['storage'],
+                               '--name', f'vps-order-{order}', '--description', self.e.marker(row)), self.pve.calls)
+                calls = list(self.pve.calls)
+                self.assertEqual(self.handle('create', order_id=order, os=os_name, disk_gb=25), first)
+                with self.assertRaises(engine.Refused):
+                    self.handle('create', order_id=order, os='Debian 13' if os_name != 'Debian 13' else 'Ubuntu 24.04', disk_gb=25)
+                self.assertEqual(self.pve.calls, calls)
+
+    def test_default_os_replays_historic_spec_without_template_or_mutation(self):
+        first = self.handle('create')
+        row = self.e.db.execute('SELECT * FROM allocation').fetchone()
+        self.assertEqual(json.loads(row['spec']), {'plan': 'mini', 'ssh_key': KEY})
+        marker = self.pve.config(first['vmid'])['description']
+        del self.pve.vms[9000]
+        calls = list(self.pve.calls)
+        self.assertEqual(self.handle('create', os='Ubuntu 24.04'), first)
+        self.assertEqual(self.handle('create', os=None), first)
+        self.assertEqual(self.handle('create'), first)
+        self.assertEqual(self.pve.calls, calls)
+        self.assertEqual(self.pve.config(first['vmid'])['description'], marker)
+        self.assertEqual(self.e.owned_config(row)['description'], marker)
+
+    def test_nondefault_os_retry_uses_frozen_spec_after_interrupted_clone(self):
+        self.add_os_templates()
+        self.pve.crash_after_clone = True
+        with self.assertRaises(OSError):
+            self.handle('create', os='Debian 13')
+        del self.pve.vms[9003]
+        self.assertEqual(self.handle('create', os='Debian 13')['vmid'], 1100)
+        self.assertEqual([call[1] for call in self.pve.calls if call[0] == 'clone'], [9003])
+        calls = list(self.pve.calls)
+        with self.assertRaises(engine.Refused):
+            self.handle('create')
+        self.assertEqual(self.pve.calls, calls)
+
+    def test_invalid_or_unavailable_os_fails_before_allocation_and_credentials(self):
+        for os_name in ('Debian 13', 'Ubuntu 22.04', 'Ubuntu 26.04', 'Ubuntu 20.04', '', 13, {}):
+            with self.subTest(os=os_name), self.assertRaises(engine.Refused):
+                self.handle('create', os=os_name, ssh_key='')
+        self.add_os_templates()
+        for field, value in (('description', 'foreign'), ('template', 0), ('_type', 'lxc')):
+            saved = self.pve.vms[9003].copy()
+            self.pve.vms[9003][field] = value
+            with self.subTest(field=field), self.assertRaises(engine.Refused):
+                self.handle('create', os='Debian 13', ssh_key='')
+            self.pve.vms[9003] = saved
+        del self.pve.vms[9003]
+        with self.assertRaises(engine.Refused):
+            self.handle('create', os='Debian 13', ssh_key='')
+        self.assertEqual(self.pve.calls, [])
+        self.assertEqual(self.e.db.execute('SELECT count(*) FROM allocation').fetchone()[0], 0)
+        self.assertEqual(self.e.db.execute('SELECT count(*) FROM credential').fetchone()[0], 0)
+        self.assertFalse((Path(self.temp.name) / 'state/credential.key').exists())
+
+    def test_configured_default_template_is_used_and_request_cannot_override_inventory(self):
+        self.add_os_templates()
+        marker = 'proxmox-pilot:v1:template:test-default'
+        self.config['templates']['Ubuntu 24.04'] = {'template_id': 9004, 'template_marker': marker}
+        self.pve.vms[9004] = {**self.pve.vms[9000], 'description': marker}
+        first = self.handle('create', os='Ubuntu 24.04', template_id=9000, template_marker=self.config['template_marker'])
+        self.assertEqual([call[1] for call in self.pve.calls if call[0] == 'clone'], [9004])
+        self.assertEqual(self.handle('create'), first)
+
+    def test_malformed_template_catalog_fails_closed_without_using_default(self):
+        for configured in (None, {}, {'template_id': True, 'template_marker': 'owned'},
+                           {'template_id': 9000, 'template_marker': ''}, {'template_id': '9000', 'template_marker': 'owned'}):
+            self.config['templates'] = {'Ubuntu 24.04': configured}
+            with self.subTest(configured=configured), self.assertRaises(engine.Refused):
+                self.handle('create', ssh_key='')
+        self.config['templates'] = []
+        with self.assertRaises(engine.Refused):
+            self.handle('create', ssh_key='')
+        self.assertEqual(self.pve.calls, [])
+        self.assertEqual(self.e.db.execute('SELECT count(*) FROM allocation').fetchone()[0], 0)
+        self.assertEqual(self.e.db.execute('SELECT count(*) FROM credential').fetchone()[0], 0)
 
     def test_password_checks_ssh_readiness_in_the_same_request(self):
         self.handle('create', ssh_key='')
@@ -328,7 +466,10 @@ class EngineTests(unittest.TestCase):
         account = cloud['chpasswd']['users'][0]
         self.assertEqual((account['name'], account['type']), ('vpsadmin', 'hash'))
         self.assertTrue(account['password'].startswith('$6$'))
-        self.assertNotIn(['chage', '-d', '0', 'vpsadmin'], cloud['runcmd'])
+        self.assertEqual(cloud['runcmd'], [
+            ['chage', '-d', '0', 'vpsadmin'],
+            ['systemctl', 'enable', '--now', 'qemu-guest-agent'],
+        ])
         self.assertNotIn(secret, snippet.read_text())
         stored = self.e.db.execute('SELECT * FROM credential').fetchone()
         self.assertNotIn(secret, str(dict(stored)))
