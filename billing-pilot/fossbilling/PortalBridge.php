@@ -18,6 +18,7 @@ final class PortalBridge
             $columns = $this->db->query('PRAGMA table_info('.$table.')')->fetchAll(PDO::FETCH_COLUMN,1);
             if (!in_array('network_mode',$columns,true)) { $this->db->exec("ALTER TABLE ".$table." ADD COLUMN network_mode TEXT NOT NULL DEFAULT 'nat'"); }
             if (!in_array('lease_id',$columns,true)) { $this->db->exec('ALTER TABLE '.$table.' ADD COLUMN lease_id TEXT'); }
+            if (!in_array('disk_gb',$columns,true)) { $this->db->exec('ALTER TABLE '.$table.' ADD COLUMN disk_gb INTEGER'); }
         }
         chmod($directory . '/portal.sqlite', 0600);
         file_put_contents($directory . '/.htaccess', "Require all denied\n");
@@ -71,6 +72,12 @@ final class PortalBridge
             if (!$row) { $row = $this->row('SELECT * FROM retired_orders WHERE reference=?', [$r['reference']]); }
             if ($r['action'] === 'create') {
                 if (!in_array($r['plan'] ?? '', ['mini', 'small', 'medium'], true)) { throw new InvalidArgumentException('Invalid plan'); }
+                [$baseDisk, $maximumDisk] = ['mini'=>[20,40], 'small'=>[50,80], 'medium'=>[80,120]][$r['plan']];
+                $disk = $r['disk_gb'] ?? $baseDisk;
+                if (!is_int($disk) || $disk < $baseDisk || $disk > $maximumDisk || ($disk - $baseDisk) % 5 !== 0) {
+                    throw new InvalidArgumentException('Invalid SSD size');
+                }
+                if ($row && (int) ($row['disk_gb'] ?? $baseDisk) !== $disk) { throw new DomainException('Disk reference conflict'); }
                 $mode=$r['network_mode']??'nat';
                 if(!in_array($mode,['nat','public_ipv4'],true))throw new InvalidArgumentException('Invalid network mode');
                 if($mode==='public_ipv4'&&(!is_string($r['lease_id']??null)||!preg_match('/^[0-9a-f-]{36}$/D',$r['lease_id'])))throw new InvalidArgumentException('Missing IPv4 lease');
@@ -87,11 +94,11 @@ final class PortalBridge
                         try {
                             $this->write('INSERT INTO retired_orders SELECT * FROM orders WHERE reference=?', [$previous['reference']]);
                             $this->write('DELETE FROM orders WHERE reference=?', [$previous['reference']]);
-                            $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id) VALUES(?,?,?,?,?)', [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null]);
+                            $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id,disk_gb) VALUES(?,?,?,?,?,?)', [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null, $disk]);
                             $this->db->commit();
                         } catch (Throwable $e) { $this->db->rollBack(); throw $e; }
                     } else {
-                    $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id) VALUES(?,?,?,?,?)', [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null]);
+                    $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id,disk_gb) VALUES(?,?,?,?,?,?)', [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null, $disk]);
                     }
                     $row = $this->row('SELECT * FROM orders WHERE reference=?', [$r['reference']]);
                 }
@@ -107,7 +114,7 @@ final class PortalBridge
             $clientId = (int) $client['client_id'];
             if (!$row['order_id']) {
                 if ($r['action'] !== 'create') { throw new OutOfBoundsException('Order not found'); }
-                $id = $this->foss->order($clientId, $r['reference'], $row['plan'], ['network_mode'=>$row['network_mode'],'lease_id'=>$row['lease_id'],'account'=>$r['account'],'reference'=>$r['reference']]);
+                $id = $this->foss->order($clientId, $r['reference'], $row['plan'], ['disk_gb'=>$row['disk_gb'] === null ? null : (int) $row['disk_gb'], 'network_mode'=>$row['network_mode'],'lease_id'=>$row['lease_id'],'account'=>$r['account'],'reference'=>$r['reference']]);
                 $this->write('UPDATE orders SET order_id=? WHERE reference=?', [$id, $r['reference']]);
                 $row['order_id'] = $id;
             }

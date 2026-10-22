@@ -201,6 +201,24 @@ class EngineTests(unittest.TestCase):
         self.pve.is_ready = True
         self.assertEqual(self.handle('password')['user'], 'vpsadmin')
 
+    def test_selected_ssd_is_resized_and_retries_keep_the_same_disk(self):
+        first = self.handle('create', disk_gb=25)
+        self.assertIn(('resize', first['vmid'], 25), self.pve.calls)
+        calls = list(self.pve.calls)
+        self.assertEqual(self.handle('create', disk_gb=25), first)
+        self.assertEqual(self.pve.calls, calls)
+        with self.assertRaises(engine.Refused):
+            self.handle('create', disk_gb=30)
+        with self.assertRaises(engine.Refused):
+            self.handle('create')
+
+    def test_invalid_ssd_is_rejected_without_allocating_a_vm(self):
+        for size in [0, 19, 21, 45, True, '25']:
+            with self.subTest(size=size), self.assertRaises(engine.Refused):
+                self.handle('create', disk_gb=size)
+        self.assertEqual(self.pve.calls, [])
+        self.assertEqual(self.e.db.execute('SELECT count(*) FROM allocation').fetchone()[0], 0)
+
     def test_paid_activation_is_idempotent(self):
         first = self.handle('create')
         calls = list(self.pve.calls)

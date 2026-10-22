@@ -13,7 +13,7 @@ final class PublicFoss {
 }
 $directory=sys_get_temp_dir().'/public-portal-'.bin2hex(random_bytes(8));
 $f=new PublicFoss();$b=new PortalBridge($f,$directory);
-$r=['account'=>'11111111-1111-4111-8111-111111111111','reference'=>'22222222-2222-4222-8222-222222222222','plan'=>'mini','network_mode'=>'public_ipv4'];
+$r=['account'=>'11111111-1111-4111-8111-111111111111','reference'=>'22222222-2222-4222-8222-222222222222','plan'=>'mini','disk_gb'=>25,'network_mode'=>'public_ipv4'];
 $lease=$b->handle($r+['action'=>'network_reserve']);check($lease['address']==='198.51.100.3');
 try{$b->handle($r+['action'=>'create']);throw new RuntimeException('Missing lease was accepted');}catch(InvalidArgumentException $expected){}
 $db=new PDO('sqlite:'.$directory.'/portal.sqlite');
@@ -23,6 +23,9 @@ $db->exec("CREATE TRIGGER reservation_crash AFTER INSERT ON orders WHEN NEW.netw
 try{$b->handle($r+['action'=>'create','lease_id'=>$lease['id']]);}catch(PDOException $crash){check(str_contains($crash->getMessage(),'injected reservation crash'));}
 $result=$b->handle($r+['action'=>'create','lease_id'=>$lease['id']]);check($result['network_mode']==='public_ipv4'&&$result['ssh_port']===22);
 check($f->config['account']===$r['account']&&$f->config['reference']===$r['reference']);
+check($f->config['disk_gb']===25);
+try{$b->handle(array_merge($r,['action'=>'create','lease_id'=>$lease['id'],'disk_gb'=>30]));throw new RuntimeException('Changed SSD was accepted');}catch(DomainException $expected){}
+try{$b->handle(array_merge($r,['action'=>'create','lease_id'=>$lease['id'],'disk_gb'=>21]));throw new RuntimeException('Invalid SSD was accepted');}catch(InvalidArgumentException $expected){}
 check($b->handle($r+['action'=>'create','lease_id'=>$lease['id']])===$result);
 try{$b->handle(array_merge($r,['action'=>'create','network_mode'=>'nat']));throw new RuntimeException('Changed network was accepted');}catch(DomainException $expected){}
 $f->phases[1]='deleted';

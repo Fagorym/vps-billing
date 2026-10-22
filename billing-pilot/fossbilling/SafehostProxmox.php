@@ -12,6 +12,7 @@ class SafehostProxmox
         $this->finance()->check($order,'activate');
         $this->request('create', $order, [
             'plan' => $this->config['plan'] ?? '',
+            'disk_gb' => $data['disk_gb'] ?? null,
             'ssh_key' => $data['ssh_key'] ?? '',
             'network_mode'=>$data['network_mode']??'nat', 'lease_id'=>$data['lease_id']??null,
             'account'=>$data['account']??null,'reference'=>$data['reference']??null,

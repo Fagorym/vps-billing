@@ -403,6 +403,15 @@ class Engine:
     def now():
         return datetime.now(timezone.utc).isoformat()
 
+    def allocation_plan(self, spec):
+        plan = dict(self.c['plans'][spec['plan']])
+        size = spec.get('disk_gb', plan['disk_gb'])
+        maximum = {'mini': 40, 'small': 80, 'medium': 120}[spec['plan']]
+        require(type(size) is int and plan['disk_gb'] <= size <= maximum
+                and (size - plan['disk_gb']) % 5 == 0, 'Недопустимый объём SSD')
+        plan['disk_gb'] = size
+        return plan
+
     def capacity(self, plan, restoring=None):
         guests = self.pve.guests()
         excluded = set()
@@ -541,7 +550,7 @@ class Engine:
             result = self.info(row)
         else:
             require(phase in ('archived', 'restoring'), 'Восстановление доступно только из архива')
-            self.capacity(self.c['plans'][json.loads(row['spec'])['plan']], restoring=row)
+            self.capacity(self.allocation_plan(json.loads(row['spec'])), restoring=row)
             self.phase(row, 'restoring')
             if json.loads(row['spec']).get('network_mode') == 'public_ipv4':
                 self.restore_public(row)
@@ -564,7 +573,7 @@ class Engine:
                 lease = self.ipam.bind(spec['account'], spec['reference'], spec['lease_id'], row['order_id'], row['client_id'])
         if lease:
             require(lease['address'] not in declared_ips(self.pve, self.c['node'], exclude=vmid), 'Публичный IP занят сторонней VM')
-        plan = self.c['plans'][spec['plan']]
+        plan = self.allocation_plan(spec)
         if vmid not in self.pve.guests():
             require(row['phase'] == 'reserved', 'Ранее созданная VM исчезла; автоматическое восстановление запрещено')
             ip = str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])
@@ -674,7 +683,7 @@ class Engine:
         rows = list(self.db.execute('SELECT * FROM allocation')) + list(self.db.execute('SELECT * FROM retired_allocation'))
         for row in rows:
             info = self.info(row, guests=guests, configs=qemu_configs)
-            plan = self.c['plans'][json.loads(row['spec'])['plan']]
+            plan = self.allocation_plan(json.loads(row['spec']))
             metrics = dict.fromkeys(('cpuFraction', 'memoryUsedBytes', 'memoryTotalBytes', 'guestDiskUsedBytes', 'guestDiskTotalBytes'))
             if info['ownership'] == 'owned':
                 guest = guests[self.vmid(row)]
@@ -735,6 +744,13 @@ class Engine:
             key = request.get('ssh_key', '')
             require(key is None or isinstance(key, str), 'Некорректный публичный SSH-ключ')
             spec = {'plan': request['plan'], 'ssh_key': ssh_key(key) if key and key.strip() else None}
+            requested_disk = request.get('disk_gb')
+            if requested_disk is not None:
+                spec['disk_gb'] = requested_disk
+            selected_plan = self.allocation_plan(spec)
+            # Base-size requests retain the historical idempotency fingerprint.
+            if selected_plan['disk_gb'] == self.c['plans'][request['plan']]['disk_gb']:
+                spec.pop('disk_gb', None)
             mode = request.get('network_mode', 'nat')
             require(mode in ('nat', 'public_ipv4'), 'Неизвестный режим сети')
             if mode == 'public_ipv4':
