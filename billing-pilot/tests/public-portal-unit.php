@@ -32,5 +32,5 @@ $f->phases[1]='deleted';
 $replacement=array_merge($r,['action'=>'create','reference'=>'44444444-4444-4444-8444-444444444444','lease_id'=>'55555555-5555-4555-8555-555555555555']);
 $next=$b->handle($replacement);check($next['order_id']===2&&$next['lease_id']===$replacement['lease_id']);
 check($b->handle($replacement)===$next);
-check($db->query('SELECT network_mode FROM retired_orders')->fetchColumn()==='public_ipv4');
+check($db->query("SELECT network_mode FROM orders WHERE reference='".$r['reference']."'")->fetchColumn()==='public_ipv4');
 echo "PASS: atomic public portal lease contract, replacement, immutable network and identity\n";

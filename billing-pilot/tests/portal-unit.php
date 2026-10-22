@@ -51,7 +51,7 @@ $r=['action'=>'create','account'=>'11111111-1111-4111-8111-111111111111','refere
 denied(fn()=>$bridge->handle($r),RuntimeException::class);
 $bridge=new PortalBridge($foss,$dir);$first=$bridge->handle($r);assertPortal($first===$bridge->handle($r));
 assertPortal($foss->clients===1&&$foss->orders===1&&$foss->activations===1);
-$other=$r;$other['reference']='33333333-3333-4333-8333-333333333333';denied(fn()=>$bridge->handle($other),DomainException::class);
+$other=$r;$other['reference']='33333333-3333-4333-8333-333333333333';$second=$bridge->handle($other);assertPortal($second['order_id']===2&&$foss->clients===1);assertPortal($bridge->handle($other)===$second);
 $other=$r;$other['account']='44444444-4444-4444-8444-444444444444';$other['action']='password';denied(fn()=>$bridge->handle($other),OutOfBoundsException::class);
 $other=$r;$other['plan']='medium';denied(fn()=>$bridge->handle($other),DomainException::class);
 assertPortal(!isset($first['password']));$r['action']='password';$foss->calls=[];assertPortal($bridge->handle($r)['password']==='initial-secret');assertPortal($foss->calls===['initial_password']);
@@ -62,12 +62,29 @@ $r['action']='stop';assertPortal($bridge->handle($r)['phase']==='suspended');ass
 $r['action']='start';assertPortal($bridge->handle($r)['phase']==='preparing');assertPortal($foss->ownerCalls===[false,true]);
 $foss->suspend(1);denied(fn()=>$bridge->handle($r),DomainException::class);
 $next=$r;$next['action']='create';$next['reference']='55555555-5555-4555-8555-555555555555';
-foreach(['blocked','archived','missing','cancelled'] as $phase){$foss->phases[1]=$phase;denied(fn()=>$bridge->handle($next),DomainException::class);}
-$foss->phases[1]='deleted';$replacement=$bridge->handle($next);assertPortal($replacement['order_id']===2);
-$r['action']='status';assertPortal($bridge->handle($r)['phase']==='deleted');
-$r['action']='create';assertPortal($bridge->handle($r)['phase']==='deleted'&&$foss->orders===2);
+$foss->phases[1]='blocked';$replacement=$bridge->handle($next);assertPortal($replacement['order_id']===3);
 $r['action']='start';denied(fn()=>$bridge->handle($r),DomainException::class);
-$foss->deleteNative(2);$next['action']='status';assertPortal($bridge->handle($next)['phase']==='cancelled');
+$foss->phases[1]='deleted';$r['action']='status';assertPortal($bridge->handle($r)['phase']==='deleted');
+$r['action']='create';assertPortal($bridge->handle($r)['phase']==='deleted'&&$foss->orders===3);
+$r['action']='start';denied(fn()=>$bridge->handle($r),DomainException::class);
+$foss->deleteNative(3);$next['action']='status';assertPortal($bridge->handle($next)['phase']==='cancelled');
 $next['action']='start';denied(fn()=>$bridge->handle($next),DomainException::class);
-$next['action']='create';$next['reference']='66666666-6666-4666-8666-666666666666';denied(fn()=>$bridge->handle($next),DomainException::class);
-echo "PASS: portal durable recovery, immutable identity, quota, ownership, readiness, password isolation\n";
+$next['action']='create';$next['reference']='66666666-6666-4666-8666-666666666666';assertPortal($bridge->handle($next)['order_id']===4);
+// Upgrade an existing single-account schema without changing current or retired bindings.
+$legacyDir=sys_get_temp_dir().'/portal-migration-'.bin2hex(random_bytes(6));mkdir($legacyDir,0700,true);
+$legacy=new PDO('sqlite:'.$legacyDir.'/portal.sqlite');$legacy->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION);
+$legacy->exec('CREATE TABLE client(account TEXT PRIMARY KEY,client_id INTEGER NOT NULL UNIQUE)');
+$legacy->exec("CREATE TABLE orders(reference TEXT PRIMARY KEY,account TEXT NOT NULL UNIQUE,plan TEXT NOT NULL,order_id INTEGER UNIQUE,network_mode TEXT NOT NULL DEFAULT 'nat',lease_id TEXT,disk_gb INTEGER)");
+$legacy->exec("CREATE TABLE retired_orders(reference TEXT PRIMARY KEY,account TEXT NOT NULL,plan TEXT NOT NULL,order_id INTEGER UNIQUE,network_mode TEXT NOT NULL DEFAULT 'nat',lease_id TEXT,disk_gb INTEGER)");
+$account='11111111-1111-4111-8111-111111111111';$reference='22222222-2222-4222-8222-222222222222';
+$legacy->exec("INSERT INTO client VALUES('$account',1)");$legacy->exec("INSERT INTO orders VALUES('$reference','$account','mini',1,'nat',NULL,NULL)");
+$legacy->exec("INSERT INTO retired_orders VALUES('33333333-3333-4333-8333-333333333333','$account','mini',99,'nat',NULL,20)");
+$before=$legacy->query('SELECT * FROM orders')->fetchAll(PDO::FETCH_ASSOC);$retired=$legacy->query('SELECT * FROM retired_orders')->fetchAll(PDO::FETCH_ASSOC);
+$migratedFoss=new FakeFoss();$migratedFoss->lose=false;$client=$migratedFoss->client($account);$native=$migratedFoss->order($client,$reference,'mini');$migratedFoss->activate($native);
+$migrated=new PortalBridge($migratedFoss,$legacyDir);$migrated=new PortalBridge($migratedFoss,$legacyDir);
+assertPortal($legacy->query('SELECT * FROM orders')->fetchAll(PDO::FETCH_ASSOC)===$before);
+assertPortal($legacy->query('SELECT * FROM retired_orders')->fetchAll(PDO::FETCH_ASSOC)===$retired);
+$existing=['account'=>$account,'reference'=>$reference,'action'=>'create','plan'=>'mini'];assertPortal($migrated->handle($existing)['order_id']===1);
+$new=$existing;$new['reference']='44444444-4444-4444-8444-444444444444';assertPortal($migrated->handle($new)['order_id']===2);
+assertPortal($migrated->handle($existing)['order_id']===1&&$migratedFoss->clients===1&&$migratedFoss->orders===2);
+echo "PASS: portal durable recovery, immutable identity, multiple VPS, ownership, readiness, password isolation\n";

@@ -12,7 +12,7 @@ final class PortalBridge
         $this->db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $this->db->exec('PRAGMA busy_timeout=30000');
         $this->db->exec('CREATE TABLE IF NOT EXISTS client (account TEXT PRIMARY KEY, client_id INTEGER NOT NULL UNIQUE)');
-        $this->db->exec('CREATE TABLE IF NOT EXISTS orders (reference TEXT PRIMARY KEY, account TEXT NOT NULL UNIQUE, plan TEXT NOT NULL, order_id INTEGER UNIQUE)');
+        $this->db->exec('CREATE TABLE IF NOT EXISTS orders (reference TEXT PRIMARY KEY, account TEXT NOT NULL, plan TEXT NOT NULL, order_id INTEGER UNIQUE)');
         $this->db->exec('CREATE TABLE IF NOT EXISTS retired_orders (reference TEXT PRIMARY KEY, account TEXT NOT NULL, plan TEXT NOT NULL, order_id INTEGER UNIQUE)');
         foreach (['orders','retired_orders'] as $table) {
             $columns = $this->db->query('PRAGMA table_info('.$table.')')->fetchAll(PDO::FETCH_COLUMN,1);
@@ -20,8 +20,41 @@ final class PortalBridge
             if (!in_array('lease_id',$columns,true)) { $this->db->exec('ALTER TABLE '.$table.' ADD COLUMN lease_id TEXT'); }
             if (!in_array('disk_gb',$columns,true)) { $this->db->exec('ALTER TABLE '.$table.' ADD COLUMN disk_gb INTEGER'); }
         }
+        $this->allowMultipleOrders();
         chmod($directory . '/portal.sqlite', 0600);
         file_put_contents($directory . '/.htaccess', "Require all denied\n");
+    }
+    private function hasAccountQuota(): bool
+    {
+        foreach ($this->db->query('PRAGMA index_list(orders)')->fetchAll(PDO::FETCH_ASSOC) as $index) {
+            if (!(bool) $index['unique']) { continue; }
+            $name = str_replace('"', '""', $index['name']);
+            $columns = $this->db->query('PRAGMA index_info("'.$name.'")')->fetchAll(PDO::FETCH_COLUMN, 2);
+            if ($columns === ['account']) { return true; }
+        }
+        return false;
+    }
+    /** Preserve all existing bindings; only the account uniqueness rule changes. */
+    private function allowMultipleOrders(): void
+    {
+        if (!$this->hasAccountQuota()) { return; }
+        $lock = fopen($this->directory . '/operation.lock', 'c');
+        if (!$lock || !flock($lock, LOCK_EX)) { throw new RuntimeException('Bridge unavailable'); }
+        try {
+            if (!$this->hasAccountQuota()) { return; }
+            $this->db->beginTransaction();
+            try {
+                $columns = $this->db->query('PRAGMA table_info(orders)')->fetchAll(PDO::FETCH_COLUMN, 1);
+                if ($columns !== ['reference','account','plan','order_id','network_mode','lease_id','disk_gb']) {
+                    throw new RuntimeException('Unexpected portal orders schema');
+                }
+                $this->db->exec("CREATE TABLE orders_multiple_vms (reference TEXT PRIMARY KEY, account TEXT NOT NULL, plan TEXT NOT NULL, order_id INTEGER UNIQUE, network_mode TEXT NOT NULL DEFAULT 'nat', lease_id TEXT, disk_gb INTEGER)");
+                $this->db->exec('INSERT INTO orders_multiple_vms SELECT * FROM orders');
+                $this->db->exec('DROP TABLE orders');
+                $this->db->exec('ALTER TABLE orders_multiple_vms RENAME TO orders');
+                $this->db->commit();
+            } catch (Throwable $e) { $this->db->rollBack(); throw $e; }
+        } finally { flock($lock, LOCK_UN); fclose($lock); }
     }
     private function row(string $sql, array $args): array|false
     {
@@ -84,22 +117,7 @@ final class PortalBridge
                 if($row&&($row['network_mode']!==$mode||$mode==='public_ipv4'&&$row['lease_id']!==$r['lease_id']))throw new DomainException('Network reference conflict');
                 if ($row && ($row['account'] !== $r['account'] || $row['plan'] !== $r['plan'])) { throw new DomainException('Reference conflict'); }
                 if (!$row) {
-                    $previous = $this->row('SELECT * FROM orders WHERE account=?', [$r['account']]);
-                    if ($previous) {
-                        $binding = $this->row('SELECT client_id FROM client WHERE account=?', [$r['account']]);
-                        if (!$binding || !$previous['order_id'] || ($this->info((int) $binding['client_id'], (int) $previous['order_id'])['phase'] ?? '') !== 'deleted') {
-                            throw new DomainException('One VPS per account');
-                        }
-                        $this->db->beginTransaction();
-                        try {
-                            $this->write('INSERT INTO retired_orders SELECT * FROM orders WHERE reference=?', [$previous['reference']]);
-                            $this->write('DELETE FROM orders WHERE reference=?', [$previous['reference']]);
-                            $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id,disk_gb) VALUES(?,?,?,?,?,?)', [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null, $disk]);
-                            $this->db->commit();
-                        } catch (Throwable $e) { $this->db->rollBack(); throw $e; }
-                    } else {
                     $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id,disk_gb) VALUES(?,?,?,?,?,?)', [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null, $disk]);
-                    }
                     $row = $this->row('SELECT * FROM orders WHERE reference=?', [$r['reference']]);
                 }
             }
