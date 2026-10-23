@@ -28,6 +28,8 @@ from ipam import Ipam, Refused as IpamRefused
 DEFAULT_OS = 'Ubuntu 24.04'
 SUPPORTED_OS = (DEFAULT_OS, 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13',
                 'Debian 12', 'AlmaLinux 9', 'AlmaLinux 10')
+RESTART_SUPERSEDING_PHASES = ('stopped', 'suspended', 'blocked', 'archiving', 'archived',
+                            'canceling', 'cancelled', 'purging', 'deleted')
 
 
 class Refused(ValueError):
@@ -57,11 +59,17 @@ def ssh_key(value):
                 'Некорректный Ed25519 ключ')
     except (ValueError, struct.error) as exc:
         raise Refused('Некорректный Ed25519 ключ') from exc
-    return ' '.join(parts[:2])
+    return 'ssh-ed25519 ' + base64.b64encode(blob).decode('ascii')
 
 
 def fingerprint(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def validated_boot_id(value):
+    require(isinstance(value, str) and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value),
+            'Не удалось проверить запуск VPS')
+    return value
 
 
 def run(args):
@@ -248,6 +256,26 @@ print encode_json(\@rows);
         from guest_network import install_guard
         install_guard(row, lease, config)
 
+    def guest_command(self, vmid, command, os_name):
+        if os_name in ('AlmaLinux 9', 'AlmaLinux 10'):
+            command = ['/usr/local/libexec/safehost-qga-exec', *command]
+        result = subprocess.run(['/usr/sbin/qm', 'guest', 'exec', str(vmid), '--timeout', '10', '--', *command],
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            raise OSError('Guest agent ещё не готов')
+        response = json.loads(result.stdout)
+        if response.get('exitcode') != 0:
+            raise OSError('Не удалось выполнить гостевую операцию')
+        return response.get('out-data', '')
+
+    def boot_id(self, vmid, os_name=DEFAULT_OS):
+        value = self.guest_command(vmid, ['/usr/bin/python3', '-c',
+            "from pathlib import Path;print(Path('/proc/sys/kernel/random/boot_id').read_text().strip())"], os_name).strip()
+        return validated_boot_id(value)
+
+    def graceful_reboot(self, vmid, os_name=DEFAULT_OS):
+        self.guest_command(vmid, ['/usr/bin/systemctl', '--no-block', 'reboot'], os_name)
+
     def remove_network_guard(self, vmid):
         from guest_network import remove_guard
         remove_guard(vmid)
@@ -304,6 +332,11 @@ class Engine:
         self.db.execute('''CREATE TABLE IF NOT EXISTS admin_operation (
             id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, order_id INTEGER NOT NULL,
             state TEXT NOT NULL, result TEXT)''')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS owner_restart (
+            id TEXT PRIMARY KEY, order_id INTEGER NOT NULL, client_id INTEGER NOT NULL,
+            owner TEXT NOT NULL, before_boot_id TEXT NOT NULL, state TEXT NOT NULL,
+            after_boot_id TEXT)''')
+        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS owner_restart_pending ON owner_restart(order_id) WHERE state='dispatched'")
         self.db.commit()
         config_hash = self.state / 'config.sha256'
         digest = fingerprint(config)
@@ -486,6 +519,7 @@ class Engine:
     def initial_password(self, row):
         require(row['phase'] == 'ready' and self.pve.status(self.vmid(row)) == 'running',
                 'Пароль доступен только у активного VPS')
+        require(not self.pending_restart(row), 'Перезагрузка VPS ещё не завершена')
         spec = json.loads(row['spec'])
         require(spec['ssh_key'] is None, 'Этот VPS использует SSH-ключ')
         ip = str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])
@@ -505,6 +539,8 @@ class Engine:
 
     def phase(self, row, value):
         self.db.execute('UPDATE allocation SET phase=? WHERE order_id=?', (value, row['order_id']))
+        if value in RESTART_SUPERSEDING_PHASES:
+            self.db.execute("UPDATE owner_restart SET state='interrupted' WHERE order_id=? AND state='dispatched'", (row['order_id'],))
         self.db.commit()
 
     @staticmethod
@@ -568,6 +604,68 @@ class Engine:
             self.stop_vm(row)
         self.phase(row, phase or ('ready' if start else 'stopped'))
         return self.info(row)
+
+    def pending_restart(self, row):
+        return self.db.execute("SELECT * FROM owner_restart WHERE order_id=? AND state='dispatched'",
+                               (row['order_id'],)).fetchone()
+
+    def is_ready(self, row, info):
+        owned_running = info['ownership'] == 'owned' and info['phase'] == 'ready' and info['status'] == 'running'
+        if not owned_running:
+            return False
+        os_name = json.loads(row['spec']).get('os', DEFAULT_OS)
+        guest_ready = self.pve.ready(self.vmid(row), info['private_ip'], os_name)
+        if not guest_ready:
+            return False
+        public_ready = info['network_mode'] != 'public_ipv4' or bool(info['public_ip']) and self.pve.public_ready(info['public_ip'])
+        return public_ready
+
+    def owner_restart(self, row, request):
+        value = request.get('operation_id')
+        require(isinstance(value, str), 'Нужен UUID операции')
+        try:
+            operation = str(uuid.UUID(value))
+        except ValueError as exc:
+            raise Refused('Нужен UUID операции') from exc
+        require(row['phase'] == 'ready', 'Перезагрузка доступна только у активного VPS')
+        require(not self.db.execute("SELECT 1 FROM admin_operation WHERE order_id=? AND state='pending'", (row['order_id'],)).fetchone(),
+                'Административная операция ещё выполняется')
+        os_name = json.loads(row['spec']).get('os', DEFAULT_OS)
+        dispatched = False
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            prior = self.db.execute('SELECT * FROM owner_restart WHERE id=?', (operation,)).fetchone()
+            if prior:
+                require((prior['order_id'], prior['client_id'], prior['owner']) ==
+                        (row['order_id'], row['client_id'], self.marker(row)), 'UUID операции уже закреплён за другим VPS')
+            else:
+                require(not self.pending_restart(row), 'Предыдущая перезагрузка ещё не завершена')
+                require(self.pve.status(self.vmid(row)) == 'running', 'Перезагрузка доступна только у запущенного VPS')
+                require(self.is_ready(row, self.info(row)), 'SSH ещё не готов; перезагрузка не отправлена')
+                before = validated_boot_id(self.pve.boot_id(self.vmid(row), os_name))
+                self.db.execute('INSERT INTO owner_restart VALUES(?,?,?,?,?,?,NULL)',
+                                (operation, row['order_id'], row['client_id'], self.marker(row), before, 'dispatched'))
+                dispatched = True
+        # The durable fence precedes dispatch. A crash in this gap deliberately
+        # requires investigation: neither this UUID nor another UUID may reboot again.
+        if dispatched:
+            try:
+                self.pve.graceful_reboot(self.vmid(row), os_name)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass  # A missing reply cannot prove whether the guest accepted reboot.
+        elif prior['state'] == 'dispatched' and self.pve.status(self.vmid(row)) == 'running':
+            try:
+                current = validated_boot_id(self.pve.boot_id(self.vmid(row), os_name))
+                info = self.info(row)
+                info['phase'] = 'ready'
+                if current != prior['before_boot_id'] and self.is_ready(row, info):
+                    with self.db:
+                        self.db.execute("UPDATE owner_restart SET state='done',after_boot_id=? WHERE id=?", (current, operation))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+        result = self.info(row)
+        result['ready'] = self.is_ready(row, result)
+        return result
 
     def admin(self, row, request):
         command = request.get('command')
@@ -767,6 +865,8 @@ class Engine:
                     ownership, current, reason = 'foreign', 'missing', 'VMID занят чужой VM или изменены её защищённые параметры'
         if current in ('suspended', 'blocked'):
             current = 'blocked'
+        elif current == 'ready' and self.pending_restart(row):
+            current = 'preparing'
         elif current == 'ready' and status == 'stopped':
             current = 'stopped'
         public = json.loads(row['spec']).get('network_mode') == 'public_ipv4'
@@ -875,7 +975,7 @@ class Engine:
         require(isinstance(request, dict), 'Ожидается JSON object')
         action = request.get('action')
         require(action in ('create', 'status', 'readiness', 'password', 'suspend', 'unsuspend', 'cancel',
-                           'owner_start', 'owner_stop', 'admin', 'monitor', 'metrics', 'network_capacity', 'network_reserve', 'network_payment_pending', 'network_release_hold'), 'Недопустимая операция')
+                           'owner_start', 'owner_stop', 'owner_restart', 'admin', 'monitor', 'metrics', 'network_capacity', 'network_reserve', 'network_payment_pending', 'network_release_hold'), 'Недопустимая операция')
         if action.startswith('network_'):
             try:
                 if action == 'network_capacity':
@@ -939,10 +1039,7 @@ class Engine:
         if action in ('status', 'readiness'):
             info = self.info(row)
             if action == 'readiness':
-                os_name = json.loads(row['spec']).get('os', DEFAULT_OS)
-                info['ready'] = (info['ownership'] == 'owned' and info['phase'] == 'ready' and info['status'] == 'running'
-                                 and self.pve.ready(self.vmid(row), info['private_ip'], os_name)
-                                 and (info['network_mode'] != 'public_ipv4' or info['public_ip'] is not None and self.pve.public_ready(info['public_ip'])))
+                info['ready'] = self.is_ready(row, info)
             return info
         if action == 'admin':
             return self.admin(row, request)
@@ -950,6 +1047,8 @@ class Engine:
         self.owned_config(row)
         if action == 'password':
             return self.initial_password(row)
+        if action == 'owner_restart':
+            return self.owner_restart(row, request)
         if action == 'cancel' and row['phase'] in ('archived', 'archiving'):
             return self.power(row, False, 'archived')
         if action in ('owner_start', 'owner_stop'):

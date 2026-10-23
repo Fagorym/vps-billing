@@ -7,6 +7,7 @@ final class FakeFoss {
  public array $calls=[];
  public array $configs=[];
  public array $metricCalls=[];
+ public array $restartCalls=[];
  public function metrics(int $client,int $order,string $timeframe): array {
   assertPortal($this->records[$order]['client_id']===$client);
   $this->metricCalls[]=[$client,$order,$timeframe];
@@ -29,6 +30,12 @@ final class FakeFoss {
  public function suspend(int $id): void {$this->records[$id]['status']='suspended';}
  public function unsuspend(int $id): void {$this->records[$id]['status']='active';}
  public function ownerPower(int $client,int $order,bool $start): array {assertPortal($this->records[$order]['client_id']===$client);if($this->records[$order]['status']!=='active')throw new DomainException('Owner cannot unblock');$this->ownerCalls[]=$start;$this->power=$start?'running':'stopped';return [];}
+ public function ownerRestart(int $client,int $order,string $operation): array {
+  assertPortal($this->records[$order]['client_id']===$client);
+  if($this->records[$order]['status']!=='active')throw new DomainException('Owner cannot unblock');
+  $this->restartCalls[]=[$client,$order,$operation];$this->phases[$order]='preparing';
+  return $this->call($client,$order,'readiness');
+ }
  public function call(int $client,int $order,string $method): array {
   assertPortal($this->records[$order]['client_id']===$client);
   $this->calls[]=$method;
@@ -128,5 +135,35 @@ denied(fn()=>$osBridge->handle(array_merge($metricsRequest,['account'=>'88888888
 foreach(['year',null,[],1] as $period)denied(fn()=>$osBridge->handle(array_merge($metricsRequest,['timeframe'=>$period])),InvalidArgumentException::class);
 assertPortal(count($osFoss->metricCalls)===$before&&$osFoss->orders===$orders&&$osFoss->activations===$activations);
 assertPortal(readWhileLocked($dir,LOCK_SH,'metrics')==='OK');
+
+// Canonical key binding survives a lost native-order reply and process restart.
+$key='ssh-ed25519 '.base64_encode(pack('N',11).'ssh-ed25519'.pack('N',32).str_repeat('a',32));
+$changedKey='ssh-ed25519 '.base64_encode(pack('N',11).'ssh-ed25519'.pack('N',32).str_repeat('b',32));
+$keyDir=sys_get_temp_dir().'/portal-key-'.bin2hex(random_bytes(6));$keyFoss=new FakeFoss();$keyBridge=new PortalBridge($keyFoss,$keyDir);
+$keyRequest=['action'=>'create','account'=>$account,'reference'=>'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','plan'=>'mini','ssh_key'=>"  $key workstation  "];
+denied(fn()=>$keyBridge->handle($keyRequest),RuntimeException::class);
+$keyBridge=new PortalBridge($keyFoss,$keyDir);
+denied(fn()=>$keyBridge->handle(array_merge($keyRequest,['ssh_key'=>$changedKey])),DomainException::class);
+denied(fn()=>$keyBridge->handle(array_diff_key($keyRequest,['ssh_key'=>true])),DomainException::class);
+assertPortal($keyFoss->orders===1&&$keyFoss->activations===0);
+$keyCreated=$keyBridge->handle(array_merge($keyRequest,['ssh_key'=>$key.' another comment']));
+assertPortal($keyCreated['auth_mode']==='key'&&$keyFoss->configs[1]['ssh_key']===$key);
+assertPortal($keyBridge->handle($keyRequest)===$keyCreated);
+$beforeCalls=$keyFoss->calls;
+denied(fn()=>$keyBridge->handle(array_merge($keyRequest,['action'=>'password'])),DomainException::class);
+assertPortal($keyFoss->calls===$beforeCalls);
+foreach([false,1,[],"$key\n$changedKey",'ssh-rsa wrong','ssh-ed25519 AAAA'] as $badKey) {
+ denied(fn()=>$keyBridge->handle(array_merge($keyRequest,['ssh_key'=>$badKey])),InvalidArgumentException::class);
+}
+$blankRequest=array_merge($keyRequest,['reference'=>'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','ssh_key'=>" \t "]);
+assertPortal($keyBridge->handle($blankRequest)['auth_mode']==='password');
+assertPortal($keyBridge->handle(array_diff_key($blankRequest,['ssh_key'=>true]))['auth_mode']==='password');
+$restart=array_merge($keyRequest,['action'=>'restart','operation_id'=>'cccccccc-cccc-4ccc-8ccc-cccccccccccc']);
+assertPortal($keyBridge->handle($restart)['phase']==='preparing');
+assertPortal($keyBridge->handle($restart)['phase']==='preparing');
+assertPortal($keyFoss->restartCalls===[[1,1,$restart['operation_id']],[1,1,$restart['operation_id']]]);
+foreach([null,'invalid',[],1] as $operation)denied(fn()=>$keyBridge->handle(array_merge($restart,['operation_id'=>$operation])),InvalidArgumentException::class);
+$keyFoss->suspend(1);denied(fn()=>$keyBridge->handle($restart),DomainException::class);
+denied(fn()=>$keyBridge->handle(array_merge($restart,['account'=>'dddddddd-dddd-4ddd-8ddd-dddddddddddd'])),OutOfBoundsException::class);
 assertPortal(readWhileLocked($dir,LOCK_EX,'metrics')==='BUSY');
 echo "PASS: portal durable recovery, immutable OS and identity, legacy migration, multiple VPS, ownership, password isolation, metrics isolation\n";

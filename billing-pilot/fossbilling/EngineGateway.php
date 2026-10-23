@@ -75,6 +75,10 @@ final class EngineGateway
     {
         return $this->request(['action' => $start ? 'owner_start' : 'owner_stop', 'client_id' => $client, 'order_id' => $order]);
     }
+    public function ownerRestart(int $client, int $order, string $operation): array
+    {
+        return $this->request(['action' => 'owner_restart', 'client_id' => $client, 'order_id' => $order, 'operation_id' => $operation]);
+    }
     public function action(array $order, string $command, array $request): array
     {
         $payload = ['action' => 'admin', 'order_id' => (int) $order['id'], 'client_id' => (int) $order['client_id'],

@@ -37,6 +37,13 @@ class FakePVE:
         self.is_ready = True
         self.crash_after_clone = False
         self.crash_after_start = False
+        self.boot_id_value = '11111111-1111-4111-8111-111111111111'
+
+    def boot_id(self, vmid, os_name=engine.DEFAULT_OS):
+        return self.boot_id_value
+
+    def graceful_reboot(self, vmid, os_name=engine.DEFAULT_OS):
+        self.calls.append(('guest-reboot', vmid, os_name))
 
     def ready(self, vmid, ip, os_name=engine.DEFAULT_OS):
         return self.is_ready

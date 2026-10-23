@@ -35,6 +35,20 @@ class PublicEngineTests(unittest.TestCase):
     def reserve_ip(self):
         return self.e.handle({'action':'network_reserve', **self.network})
 
+    def test_restart_preserves_public_lease_and_waits_for_public_ssh(self):
+        lease = self.reserve_ip()
+        created = self.handle('create', network_mode='public_ipv4', lease_id=lease['id'], **self.network)
+        before = self.pve.config(created['vmid'])
+        operation = str(uuid.uuid4())
+        self.assertEqual(self.handle('owner_restart', operation_id=operation)['phase'], 'preparing')
+        self.pve.boot_id_value = str(uuid.uuid4())
+        self.pve.public_ready = lambda ip: False
+        self.assertEqual(self.handle('owner_restart', operation_id=operation)['phase'], 'preparing')
+        self.pve.public_ready = lambda ip: True
+        self.assertTrue(self.handle('owner_restart', operation_id=operation)['ready'])
+        self.assertEqual(self.pve.config(created['vmid']), before)
+        self.assertEqual(self.e.ipam.for_order(1, 2)['id'], lease['id'])
+
     def test_invalid_or_unavailable_os_cannot_hold_public_ipv4(self):
         for os_name in ('Debian 12', 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13', '', 13):
             with self.subTest(os=os_name), self.assertRaises(engine.Refused):

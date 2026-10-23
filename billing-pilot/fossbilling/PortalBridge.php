@@ -27,6 +27,9 @@ final class PortalBridge
             if (!in_array('os', $columns, true)) {
                 $this->db->exec("ALTER TABLE ".$table." ADD COLUMN os TEXT NOT NULL DEFAULT 'Ubuntu 24.04'");
             }
+            if (!in_array('ssh_key', $columns, true)) {
+                $this->db->exec('ALTER TABLE '.$table.' ADD COLUMN ssh_key TEXT');
+            }
         }
         chmod($directory . '/portal.sqlite', 0600);
         file_put_contents($directory . '/.htaccess', "Require all denied\n");
@@ -71,6 +74,21 @@ final class PortalBridge
     {
         $s = $this->db->prepare($sql); $s->execute($args);
     }
+    private function sshKey(mixed $value): ?string
+    {
+        if ($value === null || is_string($value) && trim($value) === '') { return null; }
+        if (!is_string($value) || strlen($value) >= 1000 || str_contains($value, "\n") || str_contains($value, "\r")) {
+            throw new InvalidArgumentException('Expected one public Ed25519 SSH key');
+        }
+        $parts = preg_split('/\s+/', trim($value));
+        if (count($parts) < 2 || $parts[0] !== 'ssh-ed25519') { throw new InvalidArgumentException('Expected ssh-ed25519'); }
+        $blob = base64_decode($parts[1], true);
+        if ($blob === false || strlen($blob) !== 51 || substr($blob, 0, 4) !== pack('N', 11)
+            || substr($blob, 4, 11) !== 'ssh-ed25519' || substr($blob, 15, 4) !== pack('N', 32)) {
+            throw new InvalidArgumentException('Invalid Ed25519 SSH key');
+        }
+        return 'ssh-ed25519 '.base64_encode($blob);
+    }
     private function info(int $client, int $id): array
     {
         try {
@@ -90,12 +108,17 @@ final class PortalBridge
                 throw new InvalidArgumentException('Invalid identity');
             }
         }
-        if (!in_array($r['action'] ?? '', ['create', 'status', 'password', 'metrics', 'start', 'stop', 'network_capacity','network_reserve','network_payment_pending','network_release_hold'], true)) {
+        if (!in_array($r['action'] ?? '', ['create', 'status', 'password', 'metrics', 'start', 'stop', 'restart', 'network_capacity','network_reserve','network_payment_pending','network_release_hold'], true)) {
             throw new InvalidArgumentException('Invalid action');
         }
         if ($r['action'] === 'metrics' && !in_array($r['timeframe'] ?? '', ['day', 'week'], true)) {
             throw new InvalidArgumentException('Invalid metrics period');
         }
+        if ($r['action'] === 'restart' && (!is_string($r['operation_id'] ?? null)
+            || !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/D', $r['operation_id']))) {
+            throw new InvalidArgumentException('Expected restart operation UUID');
+        }
+        $sshKey = $r['action'] === 'create' ? $this->sshKey($r['ssh_key'] ?? null) : null;
         $os = $r['os'] ?? 'Ubuntu 24.04';
         if (in_array($r['action'], ['create', 'network_reserve'], true)
             && !in_array($os, ['Ubuntu 24.04', 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13',
@@ -122,6 +145,7 @@ final class PortalBridge
             if (!$row) { $row = $this->row('SELECT * FROM retired_orders WHERE reference=?', [$r['reference']]); }
             if ($r['action'] === 'create') {
                 if ($row && $row['os'] !== $os) { throw new DomainException('Operating system reference conflict'); }
+                if ($row && $row['ssh_key'] !== $sshKey) { throw new DomainException('SSH key reference conflict'); }
                 if (!in_array($r['plan'] ?? '', ['mini', 'small', 'medium'], true)) { throw new InvalidArgumentException('Invalid plan'); }
                 [$baseDisk, $maximumDisk] = ['mini'=>[20,40], 'small'=>[50,80], 'medium'=>[80,120]][$r['plan']];
                 $disk = $r['disk_gb'] ?? $baseDisk;
@@ -135,8 +159,8 @@ final class PortalBridge
                 if($row&&($row['network_mode']!==$mode||$mode==='public_ipv4'&&$row['lease_id']!==$r['lease_id']))throw new DomainException('Network reference conflict');
                 if ($row && ($row['account'] !== $r['account'] || $row['plan'] !== $r['plan'])) { throw new DomainException('Reference conflict'); }
                 if (!$row) {
-                    $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id,disk_gb,os) VALUES(?,?,?,?,?,?,?)',
-                        [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null, $disk, $os]);
+                    $this->write('INSERT INTO orders(reference,account,plan,network_mode,lease_id,disk_gb,os,ssh_key) VALUES(?,?,?,?,?,?,?,?)',
+                        [$r['reference'], $r['account'], $r['plan'], $mode, $mode==='public_ipv4'?$r['lease_id']:null, $disk, $os, $sshKey]);
                     $row = $this->row('SELECT * FROM orders WHERE reference=?', [$r['reference']]);
                 }
             }
@@ -151,11 +175,13 @@ final class PortalBridge
             $clientId = (int) $client['client_id'];
             if (!$row['order_id']) {
                 if ($r['action'] !== 'create') { throw new OutOfBoundsException('Order not found'); }
-                $id = $this->foss->order($clientId, $r['reference'], $row['plan'], [
+                $serviceConfig = [
                     'disk_gb'=>$row['disk_gb'] === null ? null : (int) $row['disk_gb'],
                     'network_mode'=>$row['network_mode'], 'lease_id'=>$row['lease_id'],
                     'account'=>$r['account'], 'reference'=>$r['reference'], 'os'=>$row['os'],
-                ]);
+                ];
+                if ($row['ssh_key'] !== null) { $serviceConfig['ssh_key'] = $row['ssh_key']; }
+                $id = $this->foss->order($clientId, $r['reference'], $row['plan'], $serviceConfig);
                 $this->write('UPDATE orders SET order_id=? WHERE reference=?', [$id, $r['reference']]);
                 $row['order_id'] = $id;
             }
@@ -174,6 +200,7 @@ final class PortalBridge
             }
             if ($r['action'] === 'password') {
                 if ($order['status'] !== 'active') { throw new DomainException('VPS inactive'); }
+                if ($row['ssh_key'] !== null) { throw new DomainException('VPS uses an SSH key'); }
                 // The adapter checks ownership, VM state and SSH readiness in this same call.
                 return $this->foss->call($clientId, $id, 'initial_password');
             }
@@ -181,7 +208,11 @@ final class PortalBridge
                 if ($order['status'] !== 'active') { throw new DomainException('Owner cannot lift an administrative suspension'); }
                 $this->foss->ownerPower($clientId, $id, $r['action'] === 'start');
             }
-            $info = $this->info($clientId, $id);
+            if ($r['action'] === 'restart' && $order['status'] !== 'active') {
+                throw new DomainException('Owner cannot restart an inactive VPS');
+            }
+            $info = $r['action'] === 'restart'
+                ? $this->foss->ownerRestart($clientId, $id, $r['operation_id']) : $this->info($clientId, $id);
             $phase = $info['phase'] ?? 'ready';
             if ($phase === 'stopped' || ($phase === 'ready' && $info['status'] === 'stopped')) { $phase = 'suspended'; }
             elseif ($phase === 'ready') { $phase = ($info['ready'] ?? false) ? 'ready' : 'preparing'; }
@@ -189,6 +220,7 @@ final class PortalBridge
             return ['order_id' => $id, 'phase' => $phase, 'reason' => $info['reason'] ?? null,
                 'status' => $info['status'], 'public_ip' => $info['public_ip'], 'ssh_port' => $info['ssh_port'],
                 'user' => $info['user'], 'ssh' => $info['ssh'], 'vmid' => $info['vmid'],
+                'auth_mode' => $info['auth_mode'] ?? ($row['ssh_key'] === null ? 'password' : 'key'),
                 'network_mode'=>$info['network_mode']??'nat','lease_id'=>$info['lease_id']??null,'lease_generation'=>$info['lease_generation']??null];
         } finally { flock($lock, LOCK_UN); fclose($lock); }
     }
@@ -265,6 +297,15 @@ final class FossPortal
         $result = (new EngineGateway())->ownerPower($client, $id, $start);
         $this->api->order_update(['id' => $id, 'status' => 'active']);
         return $result;
+    }
+    public function ownerRestart(int $client, int $id, string $operation): array
+    {
+        $data = $this->get($id);
+        if ((int) $data['client_id'] !== $client || $data['status'] !== 'active') { throw new DomainException('Owner operation unavailable'); }
+        require_once __DIR__.'/FinanceLifecycle.php';
+        FinanceLifecycle::fromDi($this->di)->check($data, 'owner_start');
+        require_once __DIR__.'/EngineGateway.php';
+        return (new EngineGateway())->ownerRestart($client, $id, $operation);
     }
     public function call(int $client, int $order, string $method): array
     {
