@@ -29,6 +29,7 @@ from ipam import Ipam, Refused as IpamRefused
 DEFAULT_OS = 'Ubuntu 24.04'
 SUPPORTED_OS = (DEFAULT_OS, 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13',
                 'Debian 12', 'AlmaLinux 9', 'AlmaLinux 10')
+METRICS_ACTIONS = ('metrics', 'infrastructure_metrics')
 RESTART_SUPERSEDING_PHASES = ('stopped', 'suspended', 'blocked', 'archiving', 'archived',
                             'canceling', 'cancelled', 'purging', 'deleted')
 
@@ -382,7 +383,8 @@ class Engine:
         registry = {}
         fields = {'vmid', 'node', 'account', 'name', 'os', 'address', 'publicIpv4', 'configSha256'}
         for entry in document['servers']:
-            require(isinstance(entry, dict) and set(entry) == fields, 'Некорректная служебная VM')
+            valid_fields = isinstance(entry, dict) and fields <= set(entry) <= fields | {'metricsSince'}
+            require(valid_fields, 'Некорректная служебная VM')
             require(type(entry['vmid']) is int and 0 < entry['vmid'] < 2147483647
                     and entry['vmid'] not in registry and isinstance(entry['node'], str)
                     and entry['node'].strip() and entry['node'] == self.c['node'],
@@ -992,25 +994,66 @@ class Engine:
                 'ssh': f'ssh -p {port} vpsadmin@{host}' if host and endpoint else None}
 
     def metrics(self, row, timeframe):
-        periods = {'day': (86400, 60), 'week': (604800, 1800)}
-        require(isinstance(timeframe, str) and timeframe in periods, 'Недопустимый период метрик')
+        duration, step = self.metrics_period(timeframe)
         require(row['phase'] not in ('deleted', 'missing'), 'История VPS недоступна')
-        duration, step = periods[timeframe]
         now = int(datetime.now(timezone.utc).timestamp())
         # RRD files survive VMID reuse. Exclude the bucket crossing allocation creation too.
         require(isinstance(row['created_at'], str), 'Неизвестна дата создания VPS; история недоступна')
         created = datetime.fromisoformat(row['created_at']).timestamp()
         cutoff = max(now - duration, created + step)
         vmid = self.vmid(row)
+        def identity(snapshot):
+            infrastructure = self.infrastructure_registry().get(vmid)
+            if infrastructure:
+                self.infrastructure_config(infrastructure, snapshot.get('guest'), snapshot.get('config'))
+            self.owned_config(row, guests={vmid: snapshot.get('guest')}, configs={vmid: snapshot.get('config')})
+        return self.read_metrics(vmid, timeframe, duration=duration, now=now, cutoff=cutoff, identity=identity)
+
+    @staticmethod
+    def metrics_period(timeframe):
+        periods = {'day': (86400, 60), 'week': (604800, 1800)}
+        require(isinstance(timeframe, str) and timeframe in periods, 'Недопустимый период метрик')
+        return periods[timeframe]
+
+    @staticmethod
+    def metrics_since(entry, observed_now):
+        value = entry.get('metricsSince')
+        require(isinstance(value, str) and re.fullmatch(
+            r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|\+00:00)', value),
+            'Нужна доверенная UTC граница истории служебной VM')
+        try:
+            registered = datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+        except (ValueError, OverflowError, OSError) as exc:
+            raise Refused('Некорректная граница истории служебной VM') from exc
+        require(math.isfinite(registered) and 0 <= registered <= observed_now,
+                'Граница истории служебной VM вне допустимого времени')
+        return registered
+
+    def infrastructure_metrics(self, account, vmid, node, timeframe):
+        duration, step = self.metrics_period(timeframe)
+        valid_account = isinstance(account, str) and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', account)
+        valid_vm = type(vmid) is int and 0 < vmid < 2147483647 and isinstance(node, str) and bool(node.strip())
+        require(valid_account and valid_vm, 'Некорректный владелец, VMID или узел служебной VM')
+        entry = self.infrastructure_registry().get(vmid)
+        owned = entry is not None and entry['account'] == account and entry['node'] == node
+        require(owned, 'Служебная VM этого владельца не найдена')
+        observed_now = datetime.now(timezone.utc).timestamp()
+        registered = self.metrics_since(entry, observed_now)
+        now = int(observed_now)
+        cutoff = max(now - duration, registered + step)
+        def identity(snapshot):
+            current = self.infrastructure_registry().get(vmid)
+            require(current == entry, 'Изменилась регистрация служебной VM во время чтения метрик')
+            self.metrics_since(current, datetime.now(timezone.utc).timestamp())
+            self.infrastructure_config(current, snapshot.get('guest'), snapshot.get('config'))
+        return self.read_metrics(vmid, timeframe, duration=duration, now=now, cutoff=cutoff, identity=identity)
+
+    def read_metrics(self, vmid, timeframe, *, duration, now, cutoff, identity):
         with self.pve.metrics_reader(vmid, timeframe) as reader:
             def check_identity():
                 snapshot = reader.identity()
                 require(isinstance(snapshot, dict), 'Некорректная конфигурация метрик')
-                infrastructure = self.infrastructure_registry().get(vmid)
-                if infrastructure:
-                    self.infrastructure_config(infrastructure, snapshot.get('guest'), snapshot.get('config'))
-                self.owned_config(row, guests={vmid: snapshot.get('guest')},
-                                  configs={vmid: snapshot.get('config')})
+                identity(snapshot)
             check_identity()
             rows = reader.history()
             check_identity()
@@ -1091,7 +1134,7 @@ class Engine:
         require(isinstance(request, dict), 'Ожидается JSON object')
         action = request.get('action')
         require(action in ('create', 'status', 'readiness', 'password', 'suspend', 'unsuspend', 'cancel',
-                           'owner_start', 'owner_stop', 'owner_restart', 'mutation_guard', 'admin', 'monitor', 'metrics', 'network_capacity', 'network_reserve', 'network_payment_pending', 'network_release_hold'), 'Недопустимая операция')
+                           'owner_start', 'owner_stop', 'owner_restart', 'mutation_guard', 'admin', 'monitor', 'network_capacity', 'network_reserve', 'network_payment_pending', 'network_release_hold') + METRICS_ACTIONS, 'Недопустимая операция')
         # A present but invalid root registry must never silently remove protection.
         self.infrastructure_registry()
         if action.startswith('network_'):
@@ -1110,6 +1153,8 @@ class Engine:
                 raise Refused(str(exc)) from exc
         if action == 'monitor':
             return self.monitor()
+        if action == 'infrastructure_metrics':
+            return self.infrastructure_metrics(request.get('account'), request.get('vmid'), request.get('node'), request.get('timeframe'))
         order, client = request.get('order_id'), request.get('client_id')
         require(type(order) is int and 1 <= order < 2147483647 and type(client) is int and 1 <= client < 2147483647,
                 'Нужны целочисленные order_id и client_id')
@@ -1209,7 +1254,7 @@ def main():
     request = json.loads(raw)
     require(isinstance(request, dict), 'Ожидается JSON object')
     with (state / 'operation.lock').open('a') as lock:
-        read_only = request.get('action') in ('status', 'readiness', 'password', 'monitor', 'metrics', 'mutation_guard', 'network_capacity')
+        read_only = request.get('action') in ('status', 'readiness', 'password', 'monitor', 'mutation_guard', 'network_capacity') + METRICS_ACTIONS
         # A pre-effect guard must wait for source cutover, rather than turn lock
         # contention into a terminal policy denial in the financial/admin queue.
         lock_mode = fcntl.LOCK_SH if request.get('action') == 'mutation_guard' else (
@@ -1218,7 +1263,7 @@ def main():
             fcntl.flock(lock, lock_mode)
         except BlockingIOError as exc:
             raise Refused('Выполняется изменение VPS; повторите запрос') from exc
-        is_metrics = request.get('action') == 'metrics'
+        is_metrics = request.get('action') in METRICS_ACTIONS
         with metrics_deadline() if is_metrics else nullcontext():
             # Config and its seal are replaced under this same lock during migrations.
             config = json.loads(Path('/etc/safehost-billing/config.json').read_text())

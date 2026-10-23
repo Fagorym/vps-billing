@@ -53,6 +53,16 @@ client 16, allocation, описание VM, MAC, адреса и диски со
 `observedAt` — UTC ISO timestamp. Отпечаток, конфигурация и credentials не
 передаются. Native `status` дополнительно содержит boolean `infrastructure`.
 
+Для истории CPU/RAM/сети запись реестра может содержать `metricsSince` — доверенный
+UTC ISO timestamp подтверждённой регистрации текущей VM (`Z` или `+00:00`, не
+раньше Unix epoch и не в будущем). Без него только история служебной VM недоступна;
+мониторинг состояния и запрет изменений сохраняются. `infrastructure_metrics`
+принимает проверенный `actor`, `vmid`, `node`, `timeframe: day|week`; владелец берётся
+только из `actor.account`. Engine сверяет регистрацию и Proxmox fingerprint до и
+после RRD. Bucket, пересекающий `metricsSince`, исключается: нижняя граница равна
+`max(начало периода, metricsSince + размер bucket)`. Allocation/client/order не
+используются для этой истории; полный monitor не вызывается.
+
 AdminBridge принимает read action `infrastructure` с обычным проверенным
 `actor`. Ответ `{servers:[...]}` строго ограничен совпадением `actor.account`;
 параметры владельца из запроса не используются. Dashboard помечает строки
