@@ -6,17 +6,22 @@ final class EngineGateway
 {
     private function request(array $payload): array
     {
+        $metrics = ($payload['action'] ?? '') === 'metrics';
         $argv = ['/usr/bin/ssh', '-T', '-i', '/run/proxmox/id_ed25519', '-o', 'IdentitiesOnly=yes',
             '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=/run/proxmox/known_hosts',
-            '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', 'root@10.10.10.1'];
-        set_time_limit(950);
+            '-o', 'ConnectTimeout='.($metrics ? '3' : '10'), '-o', 'ServerAliveInterval='.($metrics ? '5' : '15'), '-o', 'ServerAliveCountMax=3', 'root@10.10.10.1'];
+        set_time_limit($metrics ? 25 : 950);
         $process = proc_open($argv, [['pipe', 'r'], ['pipe', 'w'], ['file', '/dev/null', 'a']], $pipes);
         if (!is_resource($process)) { throw new RuntimeException('Engine unavailable'); }
         fwrite($pipes[0], json_encode($payload, JSON_THROW_ON_ERROR)); fclose($pipes[0]);
-        stream_set_timeout($pipes[1], 930);
-        $output = stream_get_contents($pipes[1], 1048576); $meta = stream_get_meta_data($pipes[1]); fclose($pipes[1]);
-        if ($meta['timed_out']) { proc_terminate($process); }
-        $rc = proc_close($process); $reply = json_decode($output ?: '', true);
+        if ($metrics) { [$output, $rc] = $this->metricsReply($process, $pipes[1]); }
+        else {
+            stream_set_timeout($pipes[1], 930);
+            $output = stream_get_contents($pipes[1], 1048576); $meta = stream_get_meta_data($pipes[1]); fclose($pipes[1]);
+            if ($meta['timed_out']) { proc_terminate($process); }
+            $rc = proc_close($process);
+        }
+        $reply = json_decode($output ?: '', true);
         if ($rc !== 0 || !is_array($reply) || ($reply['ok'] ?? false) !== true) {
             if (($reply['code'] ?? '') === 'refused') { throw new DomainException('Operation refused by engine state or capacity checks'); }
             throw new RuntimeException('Engine temporarily unavailable');
@@ -24,12 +29,38 @@ final class EngineGateway
         if (!is_array($reply['result'] ?? null)) { throw new RuntimeException('Invalid engine response'); }
         return $reply['result'];
     }
+    /** A wall-clock deadline, including partial output and a child that closes stdout early. */
+    private function metricsReply($process, $stdout, float $seconds = 20): array
+    {
+        $deadline = microtime(true) + $seconds; $output = ''; $exit = -1;
+        stream_set_blocking($stdout, false);
+        try {
+            while (true) {
+                $chunk = fread($stdout, 65536);
+                if ($chunk === false) { throw new RuntimeException('Metrics unavailable'); }
+                $output .= $chunk;
+                if (strlen($output) > 1048576) { throw new RuntimeException('Metrics response too large'); }
+                $status = proc_get_status($process);
+                if (!$status['running'] && feof($stdout)) { $exit = $status['exitcode']; break; }
+                if (microtime(true) >= $deadline) { throw new RuntimeException('Metrics deadline exceeded'); }
+                if ($chunk === '') { usleep(10000); }
+            }
+        } finally {
+            if (proc_get_status($process)['running']) { proc_terminate($process, 9); }
+            fclose($stdout); $closed = proc_close($process);
+        }
+        return [$output, $exit >= 0 ? $exit : $closed];
+    }
     public function network(array $payload): array
     {
         if(!in_array($payload['action']??'', ['network_capacity','network_reserve','network_payment_pending','network_release_hold'],true))throw new InvalidArgumentException('Invalid network action');
         return $this->request($payload);
     }
     public function monitoring(): array { return $this->request(['action' => 'monitor']); }
+    public function metrics(int $client, int $order, string $timeframe): array
+    {
+        return $this->request(['action'=>'metrics', 'client_id'=>$client, 'order_id'=>$order, 'timeframe'=>$timeframe]);
+    }
     public function state(int $client,int $order): array
     {
         try{return $this->request(['action'=>'status','client_id'=>$client,'order_id'=>$order]);}

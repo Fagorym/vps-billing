@@ -5,10 +5,12 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import socket
 import shutil
 import sqlite3
@@ -16,6 +18,7 @@ import struct
 import subprocess
 import sys
 from datetime import datetime, timezone
+from contextlib import contextmanager, nullcontext
 import uuid
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -65,6 +68,19 @@ def run(args):
     if result.returncode != 0:
         raise OSError('Сбой выполнения команды Proxmox; смотрите журнал хоста')
     return result.stdout
+
+
+@contextmanager
+def metrics_deadline(seconds=15):
+    def expired(signum, frame):
+        raise TimeoutError('Истёк срок получения метрик')
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def declared_ips(pve, node, exclude=None, *, configs=None):
@@ -201,13 +217,13 @@ print encode_json(\@rows);
 
 
 class Engine:
-    def __init__(self, config, state, snippets, pve=None):
+    def __init__(self, config, state, snippets, pve=None, *, db_timeout=30):
         self.c = config
         self.state = Path(state)
         self.snippets = Path(snippets)
         self.state.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.pve = pve or Proxmox(config)
-        self.db = sqlite3.connect(self.state / 'allocations.sqlite', timeout=30)
+        self.db = sqlite3.connect(self.state / 'allocations.sqlite', timeout=db_timeout)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('''CREATE TABLE IF NOT EXISTS allocation (
@@ -703,6 +719,45 @@ class Engine:
                 'phase': current, 'status': status, 'reason': reason, 'ownership': ownership,
                 'ssh': f'ssh -p {port} vpsadmin@{host}' if host and endpoint else None}
 
+    def metrics(self, row, timeframe):
+        periods = {'day': (86400, 60), 'week': (604800, 1800)}
+        require(isinstance(timeframe, str) and timeframe in periods, 'Недопустимый период метрик')
+        require(row['phase'] not in ('deleted', 'missing'), 'История VPS недоступна')
+        self.owned_config(row)
+        duration, step = periods[timeframe]
+        now = int(datetime.now(timezone.utc).timestamp())
+        # RRD files survive VMID reuse. Exclude the bucket crossing allocation creation too.
+        require(isinstance(row['created_at'], str), 'Неизвестна дата создания VPS; история недоступна')
+        created = datetime.fromisoformat(row['created_at']).timestamp()
+        cutoff = max(now - duration, created + step)
+        rows = self.pve.api(f'/nodes/{self.c["node"]}/qemu/{self.vmid(row)}/rrddata',
+                            timeframe=timeframe, cf='AVERAGE')
+        self.owned_config(row)
+        require(isinstance(rows, list) and len(rows) <= 2000, 'Некорректная история метрик')
+
+        def number(value, maximum=None):
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                return None
+            return value if maximum is None or value <= maximum else None
+
+        points = {}
+        for sample in rows:
+            require(isinstance(sample, dict), 'Некорректная точка метрик')
+            timestamp = sample.get('time')
+            if type(timestamp) is not int or not cutoff <= timestamp <= now:
+                continue
+            cpu = number(sample.get('cpu'), 1)
+            used, total = number(sample.get('mem')), number(sample.get('maxmem'))
+            points[timestamp] = {
+                'timestamp': timestamp, 'cpuPercent': None if cpu is None else cpu * 100,
+                'memoryUsedBytes': None if used is None else int(used),
+                'memoryTotalBytes': None if total is None else int(total),
+                'networkInBytesPerSecond': number(sample.get('netin')),
+                'networkOutBytesPerSecond': number(sample.get('netout')),
+            }
+        return {'timeframe': timeframe, 'start': now - duration, 'end': now,
+                'points': [points[key] for key in sorted(points)]}
+
     def monitor(self):
         # Request-local observations only; actions and readiness still read fresh state.
         guests = self.pve.guests()
@@ -750,7 +805,7 @@ class Engine:
         require(isinstance(request, dict), 'Ожидается JSON object')
         action = request.get('action')
         require(action in ('create', 'status', 'readiness', 'password', 'suspend', 'unsuspend', 'cancel',
-                           'owner_start', 'owner_stop', 'admin', 'monitor', 'network_capacity', 'network_reserve', 'network_payment_pending', 'network_release_hold'), 'Недопустимая операция')
+                           'owner_start', 'owner_stop', 'admin', 'monitor', 'metrics', 'network_capacity', 'network_reserve', 'network_payment_pending', 'network_release_hold'), 'Недопустимая операция')
         if action.startswith('network_'):
             try:
                 if action == 'network_capacity':
@@ -807,6 +862,8 @@ class Engine:
         if action == 'cancel' and row is None:
             return {'phase': 'cancelled', 'status': 'stopped'}
         require(row is not None and row['client_id'] == client, 'VPS этого клиента не найден')
+        if action == 'metrics':
+            return self.metrics(row, request.get('timeframe'))
         if action == 'cancel' and row['phase'] == 'deleted':
             return self.info(row)
         if action in ('status', 'readiness'):
@@ -854,18 +911,20 @@ def main():
     request = json.loads(raw)
     require(isinstance(request, dict), 'Ожидается JSON object')
     with (state / 'operation.lock').open('a') as lock:
-        read_only = request.get('action') in ('status', 'readiness', 'password', 'monitor', 'network_capacity')
+        read_only = request.get('action') in ('status', 'readiness', 'password', 'monitor', 'metrics', 'network_capacity')
         try:
             fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB if read_only else fcntl.LOCK_EX)
         except BlockingIOError as exc:
             raise Refused('Выполняется изменение VPS; повторите запрос') from exc
-        # Config and its seal are replaced under this same lock during migrations.
-        config = json.loads(Path('/etc/safehost-billing/config.json').read_text())
-        engine = Engine(config, state, '/var/lib/vz/snippets')
-        try:
-            result = engine.handle(request)
-        finally:
-            engine.db.close()
+        is_metrics = request.get('action') == 'metrics'
+        with metrics_deadline() if is_metrics else nullcontext():
+            # Config and its seal are replaced under this same lock during migrations.
+            config = json.loads(Path('/etc/safehost-billing/config.json').read_text())
+            engine = Engine(config, state, '/var/lib/vz/snippets', db_timeout=1) if is_metrics else Engine(config, state, '/var/lib/vz/snippets')
+            try:
+                result = engine.handle(request)
+            finally:
+                engine.db.close()
     print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))
 
 

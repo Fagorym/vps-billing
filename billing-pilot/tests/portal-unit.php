@@ -6,6 +6,12 @@ final class FakeFoss {
  public int $clients=0; public int $orders=0; public int $activations=0; public bool $lose=true; public bool $ready=true;
  public array $calls=[];
  public array $configs=[];
+ public array $metricCalls=[];
+ public function metrics(int $client,int $order,string $timeframe): array {
+  assertPortal($this->records[$order]['client_id']===$client);
+  $this->metricCalls[]=[$client,$order,$timeframe];
+  return ['timeframe'=>$timeframe,'start'=>1,'end'=>86401,'points'=>[]];
+ }
  public string $power='running';public array $ownerCalls=[];
  public array $phases=[];
  private array $clientIds=[]; private array $orderIds=[]; private array $records=[];
@@ -34,7 +40,7 @@ final class FakeFoss {
 function denied(callable $call,string $class): void {try{$call();throw new RuntimeException('Expected refusal');}catch(Throwable $e){assertPortal($e instanceof $class);}}
 if (($argv[1] ?? '') === 'read-child') {
  $f=new FakeFoss();$f->lose=false;$id=$f->client('11111111-1111-4111-8111-111111111111');$order=$f->order($id,'22222222-2222-4222-8222-222222222222','mini');$f->activate($order);
- try {(new PortalBridge($f,$argv[2]))->handle(['action'=>$argv[3],'account'=>'11111111-1111-4111-8111-111111111111','reference'=>'22222222-2222-4222-8222-222222222222']);echo 'OK';}
+ try {(new PortalBridge($f,$argv[2]))->handle(['action'=>$argv[3],'account'=>'11111111-1111-4111-8111-111111111111','reference'=>'22222222-2222-4222-8222-222222222222','timeframe'=>'day']);echo 'OK';}
  catch(RuntimeException $e){echo 'BUSY';}catch(Throwable $e){echo 'ERROR';}
  exit;
 }
@@ -115,4 +121,12 @@ $osDb->exec("DELETE FROM orders WHERE os='Debian 13'");
 denied(fn()=>$osBridge->handle(array_merge($osRequest,['os'=>'Ubuntu 24.04'])),DomainException::class);
 assertPortal($osBridge->handle($osRequest)['order_id']===1);
 assertPortal($osFoss->orders===$orders&&$osFoss->activations===$activations);
-echo "PASS: portal durable recovery, immutable OS and identity, legacy migration, multiple VPS, ownership, password isolation\n";
+$metricsRequest=['action'=>'metrics','account'=>$account,'reference'=>'77777777-7777-4777-8777-000000000000','timeframe'=>'day'];
+assertPortal($osBridge->handle($metricsRequest)===['timeframe'=>'day','start'=>1,'end'=>86401,'points'=>[]]);
+$before=count($osFoss->metricCalls);
+denied(fn()=>$osBridge->handle(array_merge($metricsRequest,['account'=>'88888888-8888-4888-8888-888888888888'])),OutOfBoundsException::class);
+foreach(['year',null,[],1] as $period)denied(fn()=>$osBridge->handle(array_merge($metricsRequest,['timeframe'=>$period])),InvalidArgumentException::class);
+assertPortal(count($osFoss->metricCalls)===$before&&$osFoss->orders===$orders&&$osFoss->activations===$activations);
+assertPortal(readWhileLocked($dir,LOCK_SH,'metrics')==='OK');
+assertPortal(readWhileLocked($dir,LOCK_EX,'metrics')==='BUSY');
+echo "PASS: portal durable recovery, immutable OS and identity, legacy migration, multiple VPS, ownership, password isolation, metrics isolation\n";

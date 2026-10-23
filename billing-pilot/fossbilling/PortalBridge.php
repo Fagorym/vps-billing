@@ -90,8 +90,11 @@ final class PortalBridge
                 throw new InvalidArgumentException('Invalid identity');
             }
         }
-        if (!in_array($r['action'] ?? '', ['create', 'status', 'password', 'start', 'stop', 'network_capacity','network_reserve','network_payment_pending','network_release_hold'], true)) {
+        if (!in_array($r['action'] ?? '', ['create', 'status', 'password', 'metrics', 'start', 'stop', 'network_capacity','network_reserve','network_payment_pending','network_release_hold'], true)) {
             throw new InvalidArgumentException('Invalid action');
+        }
+        if ($r['action'] === 'metrics' && !in_array($r['timeframe'] ?? '', ['day', 'week'], true)) {
+            throw new InvalidArgumentException('Invalid metrics period');
         }
         $os = $r['os'] ?? 'Ubuntu 24.04';
         if (in_array($r['action'], ['create', 'network_reserve'], true)
@@ -111,7 +114,7 @@ final class PortalBridge
         // Writers serialize reservation and activation. Reads share the lock and refuse a busy
         // writer immediately instead of queueing a credential request behind provisioning.
         $lock = fopen($this->directory . '/operation.lock', 'c');
-        $mode = in_array($r['action'], ['status', 'password'], true) ? LOCK_SH | LOCK_NB : LOCK_EX;
+        $mode = in_array($r['action'], ['status', 'password', 'metrics'], true) ? LOCK_SH | LOCK_NB : LOCK_EX;
         if (!$lock || !flock($lock, $mode)) { throw new RuntimeException('Bridge unavailable'); }
         try {
             $row = $this->row('SELECT * FROM orders WHERE reference=?', [$r['reference']]);
@@ -162,6 +165,9 @@ final class PortalBridge
                 $order = null;
             }
             if ($order && (int) $order['client_id'] !== $clientId) { throw new DomainException('Ownership changed'); }
+            if ($r['action'] === 'metrics') {
+                return $this->foss->metrics($clientId, $id, $r['timeframe']);
+            }
             if ($order && $r['action'] === 'create' && in_array($order['status'], ['pending_setup', 'failed_setup'], true)) {
                 $this->foss->activate($id); $order = $this->foss->get($id);
             }
@@ -240,6 +246,13 @@ final class FossPortal
         return $info;
     }
     public function activate(int $id): void { $this->api->order_activate(['id' => $id]); }
+    public function metrics(int $client, int $order, string $timeframe): array
+    {
+        $data = $this->get($order);
+        if ((int) $data['client_id'] !== $client) { throw new DomainException('Ownership changed'); }
+        require_once __DIR__ . '/EngineGateway.php';
+        return (new EngineGateway())->metrics($client, $order, $timeframe);
+    }
     public function suspend(int $id): void { $this->api->order_suspend(['id' => $id, 'reason' => 'Stopped from owner cabinet']); }
     public function unsuspend(int $id): void { $this->api->order_unsuspend(['id' => $id]); }
     public function ownerPower(int $client, int $id, bool $start): array
