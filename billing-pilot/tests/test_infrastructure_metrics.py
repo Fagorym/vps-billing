@@ -1,9 +1,11 @@
 import copy
 from contextlib import nullcontext
 from datetime import datetime, timezone
+from dataclasses import dataclass
 import fcntl
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -16,6 +18,12 @@ import test_engine as engine_tests
 OWNER = infrastructure.OWNER
 
 
+@dataclass(frozen=True)
+class DriftCase:
+    target: str
+    change: dict[str, object] | None
+
+
 class InfrastructureMetricsTests(unittest.TestCase):
     tearDown = infrastructure.InfrastructureTests.tearDown
     entry = infrastructure.InfrastructureTests.entry
@@ -24,9 +32,17 @@ class InfrastructureMetricsTests(unittest.TestCase):
     def setUp(self):
         infrastructure.InfrastructureTests.setUp(self)
         self.registered = int(datetime.now(timezone.utc).timestamp()) - 3600
-        for row in self.document['servers']:
-            row['metricsSince'] = datetime.fromtimestamp(self.registered, timezone.utc).isoformat()
-        self.save_registry()
+        self.metrics_path = self.e.state / 'infrastructure-metrics.json'
+        self.metrics_document = {'version': 1, 'servers': [
+            {**{key: row[key] for key in ('vmid', 'node', 'account', 'configSha256')},
+             'metricsSince': datetime.fromtimestamp(self.registered, timezone.utc).isoformat()}
+            for row in self.document['servers']]}
+        self.save_metrics()
+
+    def save_metrics(self):
+        self.metrics_path.unlink(missing_ok=True)
+        self.metrics_path.write_text(json.dumps(self.metrics_document))
+        self.metrics_path.chmod(0o600)
 
     def metrics(self, **extra):
         return self.e.handle({'action': 'infrastructure_metrics', 'account': OWNER, 'vmid': 101,
@@ -77,20 +93,66 @@ class InfrastructureMetricsTests(unittest.TestCase):
         for value in invalid:
             with self.subTest(cutoff=value):
                 if value is None:
-                    self.document['servers'][0].pop('metricsSince', None)
+                    self.metrics_document['servers'][0].pop('metricsSince', None)
                 else:
-                    self.document['servers'][0]['metricsSince'] = value
-                self.save_registry()
+                    self.metrics_document['servers'][0]['metricsSince'] = value
+                self.save_metrics()
                 with patch.object(self.pve, 'metrics_reader') as reader, self.assertRaises(engine.Refused):
                     self.metrics()
                 reader.assert_not_called()
 
-    def test_missing_cutoff_keeps_existing_monitor_and_mutation_protection(self):
-        self.document['servers'][0].pop('metricsSince')
-        self.save_registry()
-        self.assertEqual(len(self.e.handle({'action': 'monitor'})['infrastructure']), 2)
-        with self.assertRaisesRegex(engine.Refused, 'только для чтения'):
-            self.e.stop_vm({'slot': 101 - self.config['vm_first']})
+    def test_invalid_sidecar_affects_only_infrastructure_history_and_is_never_modified(self):
+        original = copy.deepcopy(self.metrics_document)
+        invalid_rows = ({'account': '11111111-1111-4111-8111-111111111111'}, {'node': 'other'},
+                        {'vmid': 102}, {'configSha256': '0' * 64}, {'extra': True})
+        def state(variant):
+            self.metrics_document = copy.deepcopy(original)
+            self.save_metrics()
+            if isinstance(variant, dict):
+                self.metrics_document['servers'][0].update(variant)
+                self.save_metrics()
+            elif variant == 'missing':
+                self.metrics_path.unlink()
+            elif variant == 'malformed':
+                self.metrics_path.write_text('{')
+            elif variant == 'duplicate_field':
+                self.metrics_path.write_text('{"version":1,"version":1,"servers":[]}')
+            elif variant == 'duplicate_vm':
+                self.metrics_document['servers'].append(self.metrics_document['servers'][0])
+                self.save_metrics()
+            elif variant == 'mode':
+                self.metrics_path.chmod(0o644)
+            elif variant == 'directory_mode':
+                self.e.state.chmod(0o755)
+            elif variant == 'symlink':
+                self.metrics_path.unlink()
+                self.metrics_path.symlink_to(self.e.state / 'infrastructure.json')
+        variants = (*invalid_rows, 'missing', 'malformed', 'duplicate_field', 'duplicate_vm',
+                    'mode', 'directory_mode', 'symlink', 'owner')
+        registry = (self.e.state / 'infrastructure.json').read_bytes()
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.e.state.chmod(0o700)
+                state(variant)
+                before = self.metrics_path.read_bytes() if self.metrics_path.exists() else None
+                # Simulate a process other than the root owner without requiring chown locally.
+                uid = os.geteuid() + 1 if variant == 'owner' else os.geteuid()
+                registry_rows = self.e.infrastructure_registry()
+                with patch.object(engine.os, 'geteuid', return_value=uid), \
+                     patch.object(self.pve, 'metrics_reader') as reader, self.assertRaises(engine.Refused):
+                    if variant == 'owner':
+                        self.e.infrastructure_metrics_registry(registry_rows, datetime.now(timezone.utc).timestamp())
+                    else:
+                        self.e.infrastructure_metrics(OWNER, 101, 'pve1', 'day')
+                reader.assert_not_called()
+                self.assertEqual(len(self.e.handle({'action': 'monitor'})['infrastructure']), 2)
+                with self.assertRaisesRegex(engine.Refused, 'только для чтения'):
+                    self.e.stop_vm({'slot': 101 - self.config['vm_first']})
+                with patch.object(self.pve, 'api', return_value=[]):
+                    self.assertEqual(self.e.handle({**self.ordinary, 'action': 'metrics', 'timeframe': 'day'})['points'], [])
+                self.assertEqual(self.metrics_path.read_bytes() if self.metrics_path.exists() else None, before)
+                self.assertEqual((self.e.state / 'infrastructure.json').read_bytes(), registry)
+        self.e.state.chmod(0o700)
 
     def test_week_excludes_bucket_crossing_registration_and_invalid_numbers(self):
         samples = [{'time': self.registered + 1799, 'cpu': .9},
@@ -111,22 +173,30 @@ class InfrastructureMetricsTests(unittest.TestCase):
                 api.assert_not_called()
         self.pve.vms[101] = original
 
-    def test_registration_and_guest_drift_after_history_discard_the_result(self):
-        original = copy.deepcopy(self.document)
-        cases = ({'account': '11111111-1111-4111-8111-111111111111'}, {'node': 'other'},
-                 {'metricsSince': datetime.fromtimestamp(self.registered + 60, timezone.utc).isoformat()},
-                 {'configSha256': '0' * 64}, None)
-        for change in cases:
-            with self.subTest(change=change):
-                self.document = copy.deepcopy(original)
+    def test_registration_sidecar_and_guest_drift_after_history_discard_the_result(self):
+        registry, sidecar = copy.deepcopy(self.document), copy.deepcopy(self.metrics_document)
+        fields = ({'account': '11111111-1111-4111-8111-111111111111'}, {'node': 'other'},
+                  {'configSha256': '0' * 64})
+        cases = [DriftCase('registry', change) for change in fields] + [DriftCase('sidecar', change) for change in fields]
+        cases += [DriftCase('sidecar', {'metricsSince': datetime.fromtimestamp(self.registered + 60, timezone.utc).isoformat()}),
+                  DriftCase('sidecar_missing', None), DriftCase('guest', None)]
+        for case in cases:
+            with self.subTest(case=case):
+                self.document, self.metrics_document = copy.deepcopy(registry), copy.deepcopy(sidecar)
                 self.save_registry()
+                self.save_metrics()
                 config = copy.deepcopy(self.pve.vms[101])
                 def drift(*args, **kwargs):
-                    if change is None:
+                    if case.target == 'guest':
                         self.pve.vms[101]['description'] = 'foreign'
-                    else:
-                        self.document['servers'][0].update(change)
+                    elif case.target == 'sidecar_missing':
+                        self.metrics_path.unlink()
+                    elif case.target == 'registry':
+                        self.document['servers'][0].update(case.change)
                         self.save_registry()
+                    else:
+                        self.metrics_document['servers'][0].update(case.change)
+                        self.save_metrics()
                     return [{'time': self.registered + 60, 'cpu': .5}]
                 with patch.object(self.pve, 'api', side_effect=drift), self.assertRaises(engine.Refused):
                     self.metrics()

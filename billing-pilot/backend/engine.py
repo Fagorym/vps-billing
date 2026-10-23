@@ -383,8 +383,7 @@ class Engine:
         registry = {}
         fields = {'vmid', 'node', 'account', 'name', 'os', 'address', 'publicIpv4', 'configSha256'}
         for entry in document['servers']:
-            valid_fields = isinstance(entry, dict) and fields <= set(entry) <= fields | {'metricsSince'}
-            require(valid_fields, 'Некорректная служебная VM')
+            require(isinstance(entry, dict) and set(entry) == fields, 'Некорректная служебная VM')
             require(type(entry['vmid']) is int and 0 < entry['vmid'] < 2147483647
                     and entry['vmid'] not in registry and isinstance(entry['node'], str)
                     and entry['node'].strip() and entry['node'] == self.c['node'],
@@ -1029,22 +1028,66 @@ class Engine:
                 'Граница истории служебной VM вне допустимого времени')
         return registered
 
+    def infrastructure_metrics_registry(self, registry, observed_now):
+        """Optional root metadata: only infrastructure history depends on this file."""
+        path = self.state / 'infrastructure-metrics.json'
+        try:
+            directory, metadata = self.state.lstat(), path.lstat()
+            private_directory = (stat.S_ISDIR(directory.st_mode) and directory.st_uid == os.geteuid()
+                                 and directory.st_mode & 0o777 == 0o700)
+            private_file = (stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.geteuid()
+                            and metadata.st_mode & 0o777 == 0o600 and metadata.st_size <= 131072)
+            require(private_directory and private_file, 'Небезопасный реестр истории служебных VM')
+            def unique_fields(pairs):
+                result = {}
+                for key, value in pairs:
+                    require(key not in result, 'Повторное поле в реестре истории служебных VM')
+                    result[key] = value
+                return result
+            document = json.loads(path.read_text(), object_pairs_hook=unique_fields)
+        except (OSError, ValueError) as exc:
+            raise Refused('Недоступен реестр истории служебных VM') from exc
+        require(isinstance(document, dict) and set(document) == {'version', 'servers'}
+                and type(document['version']) is int and document['version'] == 1
+                and isinstance(document['servers'], list) and len(document['servers']) <= 100,
+                'Некорректный реестр истории служебных VM')
+        entries = {}
+        identity_fields = ('vmid', 'node', 'account', 'configSha256')
+        fields = {*identity_fields, 'metricsSince'}
+        for entry in document['servers']:
+            valid_fields = isinstance(entry, dict) and set(entry) == fields
+            require(valid_fields, 'Некорректная запись истории служебной VM')
+            vmid = entry['vmid']
+            require(type(vmid) is int and vmid in registry and vmid not in entries,
+                    'Некорректный или повторный VMID истории служебной VM')
+            bound_identity = all(entry[field] == registry[vmid][field] for field in identity_fields)
+            require(bound_identity, 'История не соответствует регистрации служебной VM')
+            self.metrics_since(entry, observed_now)
+            entries[vmid] = entry
+        return entries
+
     def infrastructure_metrics(self, account, vmid, node, timeframe):
         duration, step = self.metrics_period(timeframe)
         valid_account = isinstance(account, str) and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', account)
         valid_vm = type(vmid) is int and 0 < vmid < 2147483647 and isinstance(node, str) and bool(node.strip())
         require(valid_account and valid_vm, 'Некорректный владелец, VMID или узел служебной VM')
-        entry = self.infrastructure_registry().get(vmid)
+        registry = self.infrastructure_registry()
+        entry = registry.get(vmid)
         owned = entry is not None and entry['account'] == account and entry['node'] == node
         require(owned, 'Служебная VM этого владельца не найдена')
         observed_now = datetime.now(timezone.utc).timestamp()
-        registered = self.metrics_since(entry, observed_now)
+        metadata = self.infrastructure_metrics_registry(registry, observed_now).get(vmid)
+        require(metadata is not None, 'Не зарегистрирована история служебной VM')
+        registered = self.metrics_since(metadata, observed_now)
         now = int(observed_now)
         cutoff = max(now - duration, registered + step)
         def identity(snapshot):
-            current = self.infrastructure_registry().get(vmid)
+            current_registry = self.infrastructure_registry()
+            current = current_registry.get(vmid)
             require(current == entry, 'Изменилась регистрация служебной VM во время чтения метрик')
-            self.metrics_since(current, datetime.now(timezone.utc).timestamp())
+            current_metadata = self.infrastructure_metrics_registry(
+                current_registry, datetime.now(timezone.utc).timestamp()).get(vmid)
+            require(current_metadata == metadata, 'Изменилась граница истории служебной VM во время чтения метрик')
             self.infrastructure_config(current, snapshot.get('guest'), snapshot.get('config'))
         return self.read_metrics(vmid, timeframe, duration=duration, now=now, cutoff=cutoff, identity=identity)
 

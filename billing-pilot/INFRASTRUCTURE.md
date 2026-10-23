@@ -53,15 +53,40 @@ client 16, allocation, описание VM, MAC, адреса и диски со
 `observedAt` — UTC ISO timestamp. Отпечаток, конфигурация и credentials не
 передаются. Native `status` дополнительно содержит boolean `infrastructure`.
 
-Для истории CPU/RAM/сети запись реестра может содержать `metricsSince` — доверенный
-UTC ISO timestamp подтверждённой регистрации текущей VM (`Z` или `+00:00`, не
-раньше Unix epoch и не в будущем). Без него только история служебной VM недоступна;
-мониторинг состояния и запрет изменений сохраняются. `infrastructure_metrics`
-принимает проверенный `actor`, `vmid`, `node`, `timeframe: day|week`; владелец берётся
-только из `actor.account`. Engine сверяет регистрацию и Proxmox fingerprint до и
-после RRD. Bucket, пересекающий `metricsSince`, исключается: нижняя граница равна
-`max(начало периода, metricsSince + размер bucket)`. Allocation/client/order не
-используются для этой истории; полный monitor не вызывается.
+Для истории CPU/RAM/сети нужен отдельный root-private файл
+`/var/lib/safehost-billing/infrastructure-metrics.json` (обычный файл root:root
+`0600` в root:root каталоге `0700`). Исходная строгая схема и байты
+`infrastructure.json` при включении истории не меняются. Схема sidecar:
+
+```json
+{
+  "version": 1,
+  "servers": [
+    {
+      "vmid": 101,
+      "node": "pve1",
+      "account": "9ac2de9e-e907-42f1-b28d-e65a2c1552a8",
+      "configSha256": "<тот же SHA-256, что в infrastructure.json>",
+      "metricsSince": "2026-10-23T15:03:37.493879+00:00"
+    }
+  ]
+}
+```
+
+Каждая запись содержит ровно эти пять полей и уникальный VMID; все четыре поля
+идентичности должны совпасть с текущим основным реестром. `metricsSince` —
+доверенный UTC ISO timestamp подтверждённой регистрации текущей VM (`Z` или
+`+00:00`, не раньше Unix epoch и не в будущем). Отсутствующий, повреждённый или
+небезопасный sidecar блокирует только историю служебных VM; monitor, запрет
+изменений и обычные metrics его не читают. Старые engine также игнорируют sidecar.
+
+`infrastructure_metrics` принимает проверенный `actor`, `vmid`, `node`,
+`timeframe: day|week`; владелец берётся только из `actor.account`. Engine повторно
+читает и сверяет обе записи и Proxmox fingerprint до и после RRD. Любое изменение
+владельца, узла, отпечатка или cutoff прекращает запрос. Bucket, пересекающий
+`metricsSince`, исключается: нижняя граница равна `max(начало периода,
+metricsSince + размер bucket)`. Allocation/client/order не используются для этой
+истории; полный monitor не вызывается.
 
 AdminBridge принимает read action `infrastructure` с обычным проверенным
 `actor`. Ответ `{servers:[...]}` строго ограничен совпадением `actor.account`;
