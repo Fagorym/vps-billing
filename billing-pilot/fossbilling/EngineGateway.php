@@ -57,6 +57,11 @@ final class EngineGateway
         return $this->request($payload);
     }
     public function monitoring(): array { return $this->request(['action' => 'monitor']); }
+    public function assertMutable(int $client, int $order): void
+    {
+        $result = $this->request(['action'=>'mutation_guard', 'client_id'=>$client, 'order_id'=>$order]);
+        if (($result['mutable'] ?? false) !== true) { throw new DomainException('Infrastructure is read-only'); }
+    }
     public function metrics(int $client, int $order, string $timeframe): array
     {
         return $this->request(['action'=>'metrics', 'client_id'=>$client, 'order_id'=>$order, 'timeframe'=>$timeframe]);

@@ -21,6 +21,7 @@ final class LoseAdminResponse {
     private bool $lose=true;
     public function __construct(private EngineGateway $engine) {}
     public function state(int $client,int $order):array{return $this->engine->state($client,$order);}
+    public function assertMutable(int $client,int $order):void{$this->engine->assertMutable($client,$order);}
     public function action(array $order,string $command,array $r): array {
         $result=$this->engine->action($order,$command,$r);
         if($this->lose){$this->lose=false;throw new RuntimeException('SECRET-RAW-TRANSPORT-FAILURE');}

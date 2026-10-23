@@ -6,7 +6,8 @@ require_once __DIR__.'/FinanceGateway.php';
 final class FinanceLifecycle
 {
     private PDO $db; private object $gateway;
-    public function __construct(private string $directory,?object $gateway=null,private ?Closure $clientLookup=null)
+    public function __construct(private string $directory,?object $gateway=null,private ?Closure $clientLookup=null,
+        private ?Closure $mutationGuard=null)
     {
         if(!is_dir($directory))mkdir($directory,0700,true);
         $this->db=new PDO('sqlite:'.$directory.'/portal.sqlite');$this->db->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION);
@@ -20,10 +21,11 @@ final class FinanceLifecycle
     }
     public static function fromDi($di): self
     {
+        require_once __DIR__.'/EngineGateway.php';
         return new self('/var/www/html/data/portal',null,static function(int $id)use($di):array{
             $client=$di['em']->getConnection()->fetchAssociative('SELECT email,last_name FROM client WHERE id=?',[$id]);
             if(!$client)throw new RuntimeException('Native client unavailable');return $client;
-        });
+        }, static fn(int $client,int $order)=>(new EngineGateway())->assertMutable($client,$order));
     }
     public static function runtime(): self
     {
@@ -54,8 +56,13 @@ final class FinanceLifecycle
     }
     private function base(array $order,string $command,array $context): array
     {
+        $this->assertMutable($order);
         return ['operationId'=>$context['operationId'],'orderId'=>(int)$order['id'],'clientId'=>(int)$order['client_id'],
             ...$this->identity((int)$order['id'],(int)$order['client_id']),'command'=>$command,'reason'=>$context['reason'],'actor'=>$context['actor']];
+    }
+    public function assertMutable(array $order): void
+    {
+        if($this->mutationGuard!==null)($this->mutationGuard)((int)$order['client_id'],(int)$order['id']);
     }
     private function send(array $base,string $stage,?array $effect=null): array
     {
@@ -71,6 +78,7 @@ final class FinanceLifecycle
     }
     public function prepareNative(array $order,string $event): array
     {
+        $this->assertMutable($order);
         if(!in_array($event,['cancel','delete'],true))throw new InvalidArgumentException('Invalid native event');
         $state=[];foreach(['status','activated_at','canceled_at','unsuspended_at','updated_at']as$key)$state[$key]=$order[$key]??null;
         if($this->row("SELECT name FROM sqlite_master WHERE type='table' AND name='admin_operation'",[])){
@@ -111,6 +119,7 @@ final class FinanceLifecycle
         $row=$this->row("SELECT * FROM finance_native WHERE state IN ('pending','prepared','effected')".($force?'':' AND next_attempt<=?').' ORDER BY id LIMIT 1',$force?[]:[gmdate('c')]);
         if(!$row)return false;$base=json_decode($row['request'],true,512,JSON_THROW_ON_ERROR);
         try{
+            $engine->assertMutable($base['clientId'],$base['orderId']);
             if($row['state']!=='effected'){
                 $this->send($base,'prepare');$effect=$engine->cancel($base['clientId'],$base['orderId']);
                 $this->write('UPDATE finance_native SET state=?,effect=? WHERE id=?',['effected',json_encode(['phase'=>$effect['phase'],'status'=>$effect['status']]),$base['operationId']]);

@@ -73,6 +73,7 @@ final class AdminBridge
         return match ($r['action'] ?? '') {
             'sync_clients' => $this->locked(true, fn() => $this->sync($r)),
             'dashboard' => $this->locked(false, fn() => $this->dashboard($r)),
+            'infrastructure' => $this->locked(false, fn() => $this->infrastructure($actor)),
             'action' => $this->enqueue($r, $actor),
             'operation' => $this->operation(self::uuid($r['operationId'] ?? null)),
             default => throw new InvalidArgumentException('Invalid action'),
@@ -111,6 +112,33 @@ final class AdminBridge
         $minor = (int) $m[2] * 100 + (int) str_pad($m[3] ?? '', 2, '0');
         return ($m[1] === '-' ? -1 : 1) * $minor;
     }
+    private static function infrastructureRows(array $report): array
+    {
+        $rows = $report['infrastructure'] ?? null;
+        if (!is_array($rows) || !array_is_list($rows)) { throw new RuntimeException('Infrastructure registry unavailable'); }
+        $fields = array_flip(['vmid','node','account','name','os','address','publicIpv4','status','phase','cores','memoryMb','diskGb','observedAt']);
+        $result = [];
+        foreach ($rows as $row) {
+            if (!is_array($row) || count(array_intersect_key($row, $fields)) !== count($fields)) { throw new RuntimeException('Invalid infrastructure observation'); }
+            self::uuid($row['account']);
+            $result[] = array_intersect_key($row, $fields);
+        }
+        return $result;
+    }
+    private function infrastructure(array $actor): array
+    {
+        $rows = self::infrastructureRows($this->engine->monitoring());
+        return ['servers' => array_values(array_filter($rows, static fn(array $row): bool => $row['account'] === $actor['account']))];
+    }
+    private static function infrastructureServer(array $row, array $maps, int $orderId = 0, ?string $createdAt = null): array
+    {
+        $client = array_search($row['account'], $maps, true);
+        return [...$row, 'infrastructure'=>true, 'orderId'=>$orderId, 'clientId'=>$client === false ? 0 : (int)$client,
+            'plan'=>'infrastructure', 'reason'=>'Служебный сервер: операции и списания отключены', 'createdAt'=>$createdAt,
+            'networkMode'=>$row['publicIpv4'] ? 'public_ipv4' : 'nat', 'leaseId'=>null,
+            'publicIp'=>$row['publicIpv4'] ? $row['address'] : null, 'sshPort'=>null,
+            'metrics'=>array_fill_keys(['cpuFraction','memoryUsedBytes','memoryTotalBytes','guestDiskUsedBytes','guestDiskTotalBytes'], null)];
+    }
     private function dashboard(array $r): array
     {
         $start = self::iso($r['dayStart'] ?? null); $end = self::iso($r['dayEnd'] ?? null);
@@ -119,19 +147,28 @@ final class AdminBridge
         $profiles = []; foreach ($this->db->query('SELECT * FROM profile') as $p) { $profiles[$p['account']] = $p; }
         $orders = []; foreach ($this->foss->orders() as $o) { $orders[(int) $o['id']] = $o; }
         $infra = $this->engine->monitoring(); $servers = []; $plans = [];
+        $infrastructure = [];
+        foreach (self::infrastructureRows($infra) as $row) { $infrastructure[$row['vmid']] = $row; }
         foreach ($infra['servers'] as $s) {
             $order = $orders[(int) $s['orderId']] ?? null;
             if ($order && (int) $order['client_id'] !== (int) $s['clientId']) { continue; }
+            if (isset($infrastructure[$s['vmid']])) {
+                $row = $infrastructure[$s['vmid']];
+                $servers[] = self::infrastructureServer($row, $maps, (int)$s['orderId'], self::fossDate($s['createdAt'] ?? $order['created_at'] ?? null));
+                unset($infrastructure[$s['vmid']]);
+                continue;
+            }
             $client = (int) $s['clientId']; $phase = $s['phase'];
             if (!$order && !in_array($phase, ['deleted','missing','archived'], true)) { $phase = 'cancelled'; }
             if ($phase !== 'deleted') { $plans[$client][$s['plan']] = true; }
             $metrics = []; foreach (['cpuFraction','memoryUsedBytes','memoryTotalBytes','guestDiskUsedBytes','guestDiskTotalBytes'] as $key) { $metrics[$key] = $s['metrics'][$key] ?? null; }
-            $servers[] = ['orderId' => (int) $s['orderId'], 'clientId' => $client, 'account' => $maps[$client] ?? null,
+            $servers[] = ['infrastructure'=>false, 'orderId' => (int) $s['orderId'], 'clientId' => $client, 'account' => $maps[$client] ?? null,
                 'name' => $order['title'] ?? ('VPS order ' . $s['orderId']), 'plan' => $s['plan'], 'vmid' => $s['vmid'], 'node' => $s['node'], 'phase' => $phase,
                 'status' => $s['status'], 'reason' => $order ? ($s['reason'] ?? null) : 'Заказ FOSSBilling удалён; retained VM доступна администратору', 'createdAt' => self::fossDate($s['createdAt'] ?? $order['activated_at'] ?? $order['created_at'] ?? null),
                 'networkMode'=>$s['network_mode']??'nat','leaseId'=>$s['lease_id']??null,
                 'publicIp' => $s['public_ip'] ?? null, 'sshPort' => $s['ssh_port'] ?? null, 'cores' => $s['cores'], 'memoryMb' => $s['memoryMb'], 'diskGb' => $s['diskGb'], 'metrics' => $metrics];
         }
+        foreach ($infrastructure as $row) { $servers[] = self::infrastructureServer($row, $maps); }
         $clients = [];
         foreach ($this->foss->clients() as $c) {
             $id = (int) $c['id']; $account = $maps[$id] ?? null; $p = $profiles[$account ?? ''] ?? null;
@@ -169,6 +206,7 @@ final class AdminBridge
             }
             // No side effect: native order lookup only. Claim/execute happens in the CLI worker.
             $order = $this->foss->managedOrder($r['orderId']);
+            $this->engine->assertMutable((int)$order['client_id'], $r['orderId']);
             $now = self::now();
             $this->write('INSERT INTO admin_operation VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', [$id,$fingerprint,$r['orderId'],(int) $order['client_id'],$command,trim($r['reason']),json_encode($actor),$canonical['confirmVmid'],'pending',null,$now,$now]);
         } finally { flock($lock, LOCK_UN); fclose($lock); }
@@ -190,6 +228,7 @@ final class AdminBridge
                 try {
                     $order = $this->foss->managedOrder((int) $row['order_id']);
                     if ((int) $order['client_id'] !== (int) $row['client_id']) { throw new DomainException('Ownership changed'); }
+                    $this->engine->assertMutable((int)$order['client_id'], (int)$row['order_id']);
                     $this->foss->effect($order, $row['command'], $request, $this->engine);
                     $this->write('UPDATE admin_operation SET state=?,error=NULL WHERE id=?', ['done',$row['id']]);
                 } catch(DomainException|OutOfBoundsException $e) {
@@ -274,6 +313,7 @@ final class FossAdmin
     public function effect(array $order, string $command, array $request, object $engine): void
     {
         $id = (int) $order['id'];
+        $engine->assertMutable((int)$order['client_id'], $id);
         if (($order['nativeMissing'] ?? false) && !in_array($command, ['archive','restore','purge'], true)) { throw new DomainException('Native order is absent'); }
         if(in_array($command,['archive','purge','restore'],true)){
             $state=$engine->state((int)$order['client_id'],$id);

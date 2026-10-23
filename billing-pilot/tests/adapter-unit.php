@@ -20,7 +20,7 @@ $finance = new FinanceLifecycle($directory, $gateway, fn(int $id): array => ['em
 $outgoing = [];
 $adapter = new SafehostProxmox(['plan'=>'small'], $finance, function(array $payload) use (&$outgoing): array {
     $outgoing[] = $payload;
-    return ['phase'=>'ready'];
+    return $payload['action']==='mutation_guard' ? ['mutable'=>true] : ['phase'=>'ready'];
 });
 $order = ['id'=>17, 'client_id'=>23, 'status'=>'pending_setup'];
 $data = ['disk_gb'=>60, 'ssh_key'=>'ssh-ed25519 example', 'network_mode'=>'public_ipv4',
@@ -40,11 +40,20 @@ adapterCheck(end($outgoing) === ['plan'=>'small', 'disk_gb'=>null, 'os'=>'Ubuntu
 $count = count($outgoing);$gateway->deny = true;
 try { $adapter->activate($data+['os'=>'Debian 13'], $order);throw new LogicException('Finance denial ignored'); }
 catch (DomainException $expected) {}
-adapterCheck(count($outgoing) === $count);
+adapterCheck(count($outgoing) === $count+1 && end($outgoing)['action']==='mutation_guard');$count=count($outgoing);
 $gateway->deny = false;
 try { $adapter->activate($data, $order, ['method'=>'activate', 'order_id'=>17]);throw new LogicException('Custom lifecycle call accepted'); }
 catch (\FOSSBilling\InformationException $expected) {}
 adapterCheck(count($outgoing) === $count && count($gateway->calls) === count($operatingSystems) + 2);
+$blocked=new SafehostProxmox(['plan'=>'small'],$finance,function(array $payload): array {
+    adapterCheck($payload['action']==='mutation_guard');throw new \FOSSBilling\InformationException('Infrastructure is read-only');
+});
+$callbacks=count($gateway->calls);
+foreach(['activate','suspend','unsuspend','cancel','delete','renew','initial_password'] as $method){
+    try{$blocked->$method([],['id'=>12,'client_id'=>16,'status'=>'active']);throw new LogicException('Infrastructure lifecycle accepted');}
+    catch(\FOSSBilling\InformationException $expected){}
+}
+adapterCheck(count($gateway->calls)===$callbacks);
 $db = new class {
     public ?object $existing = null;
     public function getExistingModelById(string $model, int $id): object { return (object)['id'=>$id]; }

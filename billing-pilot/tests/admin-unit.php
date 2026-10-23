@@ -14,9 +14,10 @@ final class AdminFakeFoss {
  public function effect(array $order,string $command,array $r,object $engine): void {$this->calls[]=$command;$engine->action($order,$command,$r);}
 }
 final class AdminFakeEngine {
- public array $calls=[];public bool $lose=true;public string $phase='ready';
+ public array $calls=[];public bool $lose=true;public string $phase='ready';public array $infrastructure=[];public array $protectedOrders=[];
+ public function assertMutable(int $client,int $order): void {if(in_array($order,$this->protectedOrders,true))throw new DomainException('Infrastructure is read-only');}
  public function action(array $o,string $cmd,array $r): array {$this->calls[]=$r['operationId'];$this->phase=$cmd==='archive'?'archived':($cmd==='purge'?'deleted':($cmd==='block'?'blocked':'ready'));if($this->lose){$this->lose=false;throw new RuntimeException('secret-RAW-EXCEPTION');}return [];}
- public function monitoring(): array {return ['hosts'=>[['node'=>'pve1','cpuFraction'=>0.2,'cpuCores'=>8,'memoryUsedBytes'=>100,'memoryTotalBytes'=>1000,'memoryReservedBytes'=>500,'vcpuReserved'=>2,'storageUsedBytes'=>100,'storageTotalBytes'=>1000,'storageFreeBytes'=>900,'slotsFree'=>9]],'servers'=>[['orderId'=>4,'clientId'=>1,'node'=>'pve1','phase'=>$this->phase,'status'=>'running','plan'=>'mini','vmid'=>1100,'public_ip'=>'80.249.131.4','ssh_port'=>22220,'reason'=>null,'cores'=>1,'memoryMb'=>1024,'diskGb'=>20,'createdAt'=>'2026-10-13T10:00:00+00:00','metrics'=>['cpuFraction'=>0.125,'memoryUsedBytes'=>100,'memoryTotalBytes'=>1024,'guestDiskUsedBytes'=>null,'guestDiskTotalBytes'=>null],'password'=>'NEVER-RETURN']]];}
+ public function monitoring(): array {return ['infrastructure'=>$this->infrastructure,'hosts'=>[['node'=>'pve1','cpuFraction'=>0.2,'cpuCores'=>8,'memoryUsedBytes'=>100,'memoryTotalBytes'=>1000,'memoryReservedBytes'=>500,'vcpuReserved'=>2,'storageUsedBytes'=>100,'storageTotalBytes'=>1000,'storageFreeBytes'=>900,'slotsFree'=>9]],'servers'=>[['orderId'=>4,'clientId'=>1,'node'=>'pve1','phase'=>$this->phase,'status'=>'running','plan'=>'mini','vmid'=>1100,'public_ip'=>'80.249.131.4','ssh_port'=>22220,'reason'=>null,'cores'=>1,'memoryMb'=>1024,'diskGb'=>20,'createdAt'=>'2026-10-13T10:00:00+00:00','metrics'=>['cpuFraction'=>0.125,'memoryUsedBytes'=>100,'memoryTotalBytes'=>1024,'guestDiskUsedBytes'=>null,'guestDiskTotalBytes'=>null],'password'=>'NEVER-RETURN']]];}
 }
 if (($argv[1] ?? '') === 'snapshot-child') {
  $bridge=new AdminBridge(new AdminFakeFoss(),new AdminFakeEngine(),$argv[2]);
@@ -71,6 +72,23 @@ adminCheck(!str_contains(json_encode($bridge->handle(['action'=>'dashboard','act
 $bad=$r;$bad['operationId']='55555555-5555-4555-8555-555555555555';$bad['command']='purge';adminDenied(fn()=>$bridge->handle($bad),InvalidArgumentException::class);
 $bad=$r;$bad['actor']['account']='not-uuid';adminDenied(fn()=>$bridge->handle($bad),InvalidArgumentException::class);
 $bad=$r;$bad['reason']='x';adminDenied(fn()=>$bridge->handle($bad),InvalidArgumentException::class);
+$infrastructureRow=['vmid'=>101,'node'=>'pve1','account'=>$profiles[0]['account'],'name'=>'safehost billing','os'=>'Ubuntu 24.04','address'=>'10.10.10.11','publicIpv4'=>false,'status'=>'running','phase'=>'ready','cores'=>2,'memoryMb'=>4096,'diskGb'=>40,'observedAt'=>'2026-10-23T00:00:00+00:00'];
+$engine->infrastructure=[$infrastructureRow,$infrastructureRow+['password'=>'NEVER-RETURN']];
+$engine->infrastructure[1]=array_replace($engine->infrastructure[1],['vmid'=>1100,'account'=>$profiles[1]['account'],'name'=>'safehost site','address'=>'45.9.88.54','publicIpv4'=>true]);
+adminCheck($bridge->handle(['action'=>'infrastructure','actor'=>$actor])===['servers'=>[]]);
+$ownerActor=['account'=>$profiles[0]['account'],'email'=>'owner@example.test'];
+$owned=$bridge->handle(['action'=>'infrastructure','actor'=>$ownerActor]);adminCheck(count($owned['servers'])===1&&$owned['servers'][0]['vmid']===101&&!str_contains(json_encode($owned),'NEVER-RETURN'));
+adminCheck($bridge->handle(['action'=>'infrastructure','actor'=>$actor,'account'=>$profiles[0]['account']])===['servers'=>[]]);
+adminDenied(fn()=>$bridge->handle(['action'=>'infrastructure','actor'=>['account'=>'bad','email'=>'owner@example.test']]),InvalidArgumentException::class);
+$readonlyDashboard=$bridge->handle(['action'=>'dashboard','actor'=>$actor,'dayStart'=>'2026-10-13T00:00:00Z','dayEnd'=>'2026-10-14T00:00:00Z']);
+adminCheck(count($readonlyDashboard['servers'])===2&&$readonlyDashboard['servers'][0]['orderId']===4&&$readonlyDashboard['servers'][0]['clientId']===2&&$readonlyDashboard['servers'][0]['account']===$profiles[1]['account']&&$readonlyDashboard['servers'][0]['infrastructure']===true);
+adminCheck($readonlyDashboard['servers'][1]['orderId']===0&&$readonlyDashboard['servers'][1]['vmid']===101&&$readonlyDashboard['servers'][1]['infrastructure']===true);
+$queueDb=new PDO('sqlite:'.$dir.'/portal.sqlite');$queuedBefore=(int)$queueDb->query('SELECT COUNT(*) FROM admin_operation')->fetchColumn();$engine->protectedOrders=[4];
+$protected=$r;$protected['operationId']='77777777-7777-4777-8777-777777777777';adminDenied(fn()=>$bridge->handle($protected),DomainException::class);
+adminCheck((int)$queueDb->query('SELECT COUNT(*) FROM admin_operation')->fetchColumn()===$queuedBefore);
+$engine->protectedOrders=[];$pending=$r;$pending['operationId']='88888888-8888-4888-8888-888888888888';$bridge->handle($pending);$effectsBefore=$engine->calls;$engine->protectedOrders=[4];
+adminCheck($bridge->processOne(true));adminCheck($engine->calls===$effectsBefore&&$bridge->handle(['action'=>'operation','actor'=>$actor,'operationId'=>$pending['operationId']])['state']==='failed');
+$engine->protectedOrders=[];$engine->infrastructure=[];
 $shared=snapshotWhileLocked($dir,LOCK_SH,null);adminCheck($shared['result']==='FOSSBilling'&&$shared['seconds']<1);
 $brief=snapshotWhileLocked($dir,LOCK_EX,200000);
 if($brief['result']!=='FOSSBilling')throw new RuntimeException('Snapshot dropped on brief lock contention: '.$brief['result']);
@@ -79,3 +97,4 @@ $busy=snapshotWhileLocked($dir,LOCK_EX,null);adminCheck($busy['result']==='Bridg
 $expired=snapshotWhileLocked($dir,LOCK_EX,5100000,pauseReader:true);adminCheck($expired['result']==='Bridge busy'&&$expired['seconds']<6.5);
 echo "PASS: admin profile sync, native balance, registration stats, whitelist, durable recovery, immutable operation, actor/reason/purge gates\n";
 echo "PASS: concurrent readers, short writer contention, bounded busy deadline\n";
+echo "PASS: owner-filtered infrastructure, readonly dashboard attribution, enqueue and recovered-worker protection\n";

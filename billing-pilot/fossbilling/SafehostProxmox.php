@@ -10,6 +10,7 @@ class SafehostProxmox
     public function activate(array $data, array $order, array $params = []): bool
     {
         $this->assertLifecycle($params);
+        $this->assertMutable($order);
         $this->finance()->check($order,'activate');
         $this->request('create', $order, [
             'plan' => $this->config['plan'] ?? '',
@@ -25,6 +26,7 @@ class SafehostProxmox
     public function suspend(array $data, array $order, array $params = []): bool
     {
         $this->assertLifecycle($params);
+        $this->assertMutable($order);
         $this->request('suspend', $order);
         return true;
     }
@@ -32,6 +34,7 @@ class SafehostProxmox
     public function unsuspend(array $data, array $order, array $params = []): bool
     {
         $this->assertLifecycle($params);
+        $this->assertMutable($order);
         $this->finance()->check($order,'unblock');
         $this->request('unsuspend', $order);
         return true;
@@ -40,6 +43,7 @@ class SafehostProxmox
     public function cancel(array $data, array $order, array $params = []): bool
     {
         $this->assertLifecycle($params);
+        $this->assertMutable($order);
         $this->finance()->native($order,'cancel',fn()=>$this->request('cancel',$order));
         return true;
     }
@@ -47,6 +51,7 @@ class SafehostProxmox
     public function delete(array $data, array $order, array $params = []): bool
     {
         $this->assertLifecycle($params);
+        $this->assertMutable($order);
         $this->finance()->native($order,'delete',fn()=>$this->request('cancel',$order));
         return true; // No qm destroy: disk and allocation remain.
     }
@@ -54,6 +59,7 @@ class SafehostProxmox
     public function renew(array $data, array $order, array $params = []): bool
     {
         $this->assertLifecycle($params);
+        $this->assertMutable($order);
         $this->request('status', $order);
         return true;
     }
@@ -72,6 +78,7 @@ class SafehostProxmox
 
     public function initial_password(array $data, array $order, array $params = []): array
     {
+        $this->assertMutable($order);
         // The core checks the authenticated client's ownership before calling this method.
         if ($order['status'] !== 'active') {
             throw new \FOSSBilling\InformationException('Пароль доступен только у активной услуги.');
@@ -96,6 +103,12 @@ class SafehostProxmox
     private function finance(): FinanceLifecycle
     {
         require_once '/opt/pilot/FinanceLifecycle.php';return $this->financeLifecycle ?? FinanceLifecycle::runtime();
+    }
+    private function assertMutable(array $order): void
+    {
+        if (($this->request('mutation_guard', $order)['mutable'] ?? false) !== true) {
+            throw new \FOSSBilling\InformationException('Служебная VM доступна только для чтения.');
+        }
     }
 
     private function request(string $action, array $order, array $extra = []): array
