@@ -98,6 +98,28 @@ def declared_ips(pve, node, exclude=None, *, configs=None):
     return used
 
 
+class MetricsReader:
+    def __init__(self, process):
+        self.process = process
+
+    def read(self, action):
+        self.process.stdin.write(json.dumps(action) + '\n')
+        self.process.stdin.flush()
+        line = self.process.stdout.readline(1048577)
+        if not line.endswith('\n') or len(line) > 1048576:
+            raise OSError('Некорректный ответ источника метрик')
+        try:
+            return json.loads(line)
+        except ValueError as exc:
+            raise OSError('Некорректный ответ источника метрик') from exc
+
+    def identity(self):
+        return self.read('identity')
+
+    def history(self):
+        return self.read('history')
+
+
 class Proxmox:
     def __init__(self, config):
         self.c = config
@@ -113,6 +135,41 @@ class Proxmox:
 
     def config(self, vmid, kind='qemu'):
         return self.api(f'/nodes/{self.c["node"]}/{kind}/{vmid}/config')
+
+    @contextmanager
+    def metrics_reader(self, vmid, timeframe):
+        # Load the canonical API once per request. No persistent process or shared history cache.
+        script = r'''
+$| = 1;
+my ($node, $vmid, $timeframe) = @ARGV;
+while (my $line = <STDIN>) {
+    my $action = decode_json($line);
+    my $result;
+    if ($action eq 'identity') {
+        PVE::Cluster::cfs_update();
+        my $guest = PVE::Cluster::get_vmlist()->{ids}->{$vmid};
+        $result = {guest => $guest, config => undef};
+        if ($guest && $guest->{node} eq $node && $guest->{type} eq 'qemu') {
+            $result->{config} = PVE::API2::Qemu->vm_config({node => $node, vmid => 0 + $vmid});
+        }
+    } elsif ($action eq 'history') {
+        $result = PVE::API2::Qemu->rrddata({
+            node => $node, vmid => 0 + $vmid, timeframe => $timeframe, cf => 'AVERAGE',
+        });
+    } else { die 'Invalid metrics read'; }
+    print encode_json($result)."\n";
+}
+'''
+        with subprocess.Popen([
+            '/usr/bin/perl', '-MPVE::API2::Qemu', '-MJSON::PP', '-e', script,
+            self.c['node'], str(vmid), timeframe,
+        ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) as process:
+            try:
+                yield MetricsReader(process)
+            finally:
+                # Includes validation failures, partial output and the outer metrics deadline.
+                if process.poll() is None:
+                    process.kill()
 
     def current_configs(self, node, exclude=None):
         # One canonical Proxmox read avoids a separate pvesh startup per VM.
@@ -723,16 +780,22 @@ class Engine:
         periods = {'day': (86400, 60), 'week': (604800, 1800)}
         require(isinstance(timeframe, str) and timeframe in periods, 'Недопустимый период метрик')
         require(row['phase'] not in ('deleted', 'missing'), 'История VPS недоступна')
-        self.owned_config(row)
         duration, step = periods[timeframe]
         now = int(datetime.now(timezone.utc).timestamp())
         # RRD files survive VMID reuse. Exclude the bucket crossing allocation creation too.
         require(isinstance(row['created_at'], str), 'Неизвестна дата создания VPS; история недоступна')
         created = datetime.fromisoformat(row['created_at']).timestamp()
         cutoff = max(now - duration, created + step)
-        rows = self.pve.api(f'/nodes/{self.c["node"]}/qemu/{self.vmid(row)}/rrddata',
-                            timeframe=timeframe, cf='AVERAGE')
-        self.owned_config(row)
+        vmid = self.vmid(row)
+        with self.pve.metrics_reader(vmid, timeframe) as reader:
+            def check_identity():
+                snapshot = reader.identity()
+                require(isinstance(snapshot, dict), 'Некорректная конфигурация метрик')
+                self.owned_config(row, guests={vmid: snapshot.get('guest')},
+                                  configs={vmid: snapshot.get('config')})
+            check_identity()
+            rows = reader.history()
+            check_identity()
         require(isinstance(rows, list) and len(rows) <= 2000, 'Некорректная история метрик')
 
         def number(value, maximum=None):

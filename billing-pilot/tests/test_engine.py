@@ -9,6 +9,7 @@ import unittest
 import fcntl
 import io
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -50,6 +51,15 @@ class FakePVE:
 
     def config(self, vmid, kind='qemu'):
         return copy.deepcopy(self.vms[vmid])
+
+    @contextmanager
+    def metrics_reader(self, vmid, timeframe):
+        def identity():
+            guest = self.guests().get(vmid)
+            config = self.config(vmid) if guest and guest['type'] == 'qemu' else None
+            return {'guest': guest, 'config': config}
+        yield SimpleNamespace(identity=identity, history=lambda: self.api(
+            f'/nodes/{self.c["node"]}/qemu/{vmid}/rrddata', timeframe=timeframe, cf='AVERAGE'))
 
     def network_configs(self, node, exclude=None):
         return [{'type':guest['type'],'config':self.config(vmid,guest['type'])}

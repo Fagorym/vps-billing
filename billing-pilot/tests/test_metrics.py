@@ -4,6 +4,7 @@ import os
 import sys
 import fcntl
 import tempfile
+import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -92,6 +93,62 @@ class MetricsTests(unittest.TestCase):
         with patch.object(self.pve, 'api') as api, self.assertRaises(engine.Refused):
             self.metrics()
         api.assert_not_called()
+
+    def helper_request(self, *, foreign=False, invalid=False, timeout=False):
+        """Exercise the real process adapter through the owned metrics entry point."""
+        vmid = self.e.vmid(self.e.db.execute('SELECT * FROM allocation').fetchone())
+        snapshot = {'guest': self.pve.guests()[vmid], 'config': self.pve.config(vmid)}
+        if foreign:
+            snapshot['config']['description'] = 'foreign'
+        log = Path(self.temp.name) / 'metrics-reads.jsonl'
+        pid = Path(self.temp.name) / 'metrics-child.pid'
+        script = r'''
+import json,os,sys,time
+from pathlib import Path
+snapshot,log,pid,invalid,timeout=sys.argv[1:]
+Path(pid).write_text(str(os.getpid()))
+for line in sys.stdin:
+    action=json.loads(line)
+    with open(log,'a') as stream: stream.write(json.dumps(action)+'\n')
+    if timeout == 'True': time.sleep(60)
+    print('broken' if invalid == 'True' else snapshot if action == 'identity' else '[]',flush=True)
+'''
+        start = subprocess.Popen
+        def launch(args, **kwargs):
+            self.assertEqual(args[0], '/usr/bin/perl')
+            self.assertEqual(args[-3:], ['pve1', str(vmid), 'day'])
+            return start([sys.executable, '-u', '-c', script, json.dumps(snapshot), str(log), str(pid),
+                          str(invalid), str(timeout)], **kwargs)
+        self.e.pve = engine.Proxmox(self.config)
+        with patch.object(engine.subprocess, 'Popen', side_effect=launch) as processes:
+            if timeout:
+                with self.assertRaises(TimeoutError), engine.metrics_deadline(.5):
+                    self.metrics()
+            elif foreign:
+                with self.assertRaises(engine.Refused):
+                    self.metrics()
+            elif invalid:
+                with self.assertRaises(OSError):
+                    self.metrics()
+            else:
+                result = self.metrics()
+                self.assertEqual(result['points'], [])
+            self.assertEqual(processes.call_count, 1)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid.read_text()), 0)
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+    def test_first_history_uses_one_process_with_fresh_checks_on_both_sides(self):
+        self.assertEqual(self.helper_request(), ['identity', 'history', 'identity'])
+
+    def test_foreign_identity_stops_before_history_and_reaps_reader(self):
+        self.assertEqual(self.helper_request(foreign=True), ['identity'])
+
+    def test_broken_reply_fails_closed_and_reaps_reader(self):
+        self.assertEqual(self.helper_request(invalid=True), ['identity'])
+
+    def test_deadline_interrupts_and_reaps_reader(self):
+        self.assertEqual(self.helper_request(timeout=True), ['identity'])
 
 
 class MetricsDeadlineTests(unittest.TestCase):
