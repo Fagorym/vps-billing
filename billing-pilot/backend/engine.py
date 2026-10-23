@@ -14,6 +14,7 @@ import signal
 import socket
 import shutil
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -354,6 +355,94 @@ class Engine:
     def vmid(self, row):
         return self.c['vm_first'] + row['slot']
 
+    def infrastructure_registry(self):
+        """Root state, independent of the immutable provisioning configuration seal."""
+        path = self.state / 'infrastructure.json'
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return {}
+        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.geteuid()
+                and metadata.st_mode & 0o077 == 0 and metadata.st_size <= 131072,
+                'Небезопасный реестр служебных VM')
+        def unique_fields(pairs):
+            result = {}
+            for key, value in pairs:
+                require(key not in result, 'Повторное поле в реестре служебных VM')
+                result[key] = value
+            return result
+        try:
+            document = json.loads(path.read_text(), object_pairs_hook=unique_fields)
+        except (OSError, ValueError) as exc:
+            raise Refused('Некорректный реестр служебных VM') from exc
+        require(isinstance(document, dict) and set(document) == {'version', 'servers'}
+                and type(document['version']) is int and document['version'] == 1
+                and isinstance(document['servers'], list) and len(document['servers']) <= 100,
+                'Некорректный реестр служебных VM')
+        registry = {}
+        fields = {'vmid', 'node', 'account', 'name', 'os', 'address', 'publicIpv4', 'configSha256'}
+        for entry in document['servers']:
+            require(isinstance(entry, dict) and set(entry) == fields, 'Некорректная служебная VM')
+            require(type(entry['vmid']) is int and 0 < entry['vmid'] < 2147483647
+                    and entry['vmid'] not in registry and isinstance(entry['node'], str)
+                    and entry['node'].strip() and entry['node'] == self.c['node'],
+                    'Некорректный VMID или узел служебной VM')
+            require(isinstance(entry['name'], str) and 1 <= len(entry['name'].strip()) <= 254
+                    and not any(ord(character) < 32 for character in entry['name']),
+                    'Нужно имя служебной VM')
+            require(isinstance(entry['account'], str)
+                    and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', entry['account'])
+                    and uuid.UUID(entry['account']).int != 0, 'Нужен UUID владельца служебной VM')
+            selected_os(entry['os'])
+            require(isinstance(entry['os'], str) and type(entry['publicIpv4']) is bool
+                    and isinstance(entry['configSha256'], str)
+                    and re.fullmatch(r'[0-9a-f]{64}', entry['configSha256']),
+                    'Некорректная идентичность служебной VM')
+            try:
+                require(isinstance(entry['address'], str), 'Нужен IPv4 служебной VM')
+                ipaddress.IPv4Address(entry['address'])
+            except ValueError as exc:
+                raise Refused('Некорректный IPv4 служебной VM') from exc
+            registry[entry['vmid']] = entry
+        return registry
+
+    def assert_mutable(self, row):
+        require(self.vmid(row) not in self.infrastructure_registry(),
+                'Служебная VM доступна только для чтения')
+
+    def infrastructure_info(self, entry, *, guests, configs):
+        vmid = entry['vmid']
+        guest, cfg = guests.get(vmid), configs.get(vmid)
+        self.infrastructure_config(entry, guest, cfg)
+        addresses = set()
+        for key, value in cfg.items():
+            if re.fullmatch(r'ipconfig\d+', key):
+                match = re.search(r'(?:^|,)ip=([0-9.]+)(?:/|,|$)', str(value))
+                if match:
+                    addresses.add(match[1])
+        require(entry['address'] in addresses, 'Не подтверждён адрес служебной VM')
+        require(guest.get('status') in ('running', 'stopped'), 'Неизвестное состояние служебной VM')
+        require(all(type(cfg.get(field)) in (int, str) and str(cfg[field]).isdigit()
+                    and int(cfg[field]) > 0 for field in ('cores', 'memory')),
+                'Не подтверждены ресурсы служебной VM')
+        disk = re.search(r'(?:^|,)size=(\d+(?:\.\d+)?)([KMGT])(?:,|$)', str(cfg.get('scsi0', '')))
+        require(disk is not None, 'Не подтверждён SSD служебной VM')
+        disk_gb = float(disk[1]) * {'K': 1 / 1048576, 'M': 1 / 1024, 'G': 1, 'T': 1024}[disk[2]]
+        require(math.isfinite(disk_gb) and disk_gb > 0, 'Не подтверждён SSD служебной VM')
+        return {key: entry[key] for key in ('vmid', 'node', 'account', 'name', 'os', 'address', 'publicIpv4')} | {
+            'status': guest['status'], 'phase': 'ready' if guest['status'] == 'running' else 'stopped',
+            'cores': int(cfg['cores']), 'memoryMb': int(cfg['memory']),
+            'diskGb': int(disk_gb) if disk_gb.is_integer() else disk_gb, 'observedAt': self.now()}
+
+    @staticmethod
+    def infrastructure_config(entry, guest, cfg):
+        require(isinstance(guest, dict) and guest.get('node') == entry['node']
+                and guest.get('type') == 'qemu' and isinstance(cfg, dict),
+                'Служебная VM отсутствует на заданном узле')
+        require(not cfg.get('template') and not cfg.get('lock')
+                and fingerprint({key: value for key, value in cfg.items() if key != 'digest'}) == entry['configSha256'],
+                'Изменилась защищённая конфигурация служебной VM')
+
     def template(self, os_name):
         templates = self.c.get('templates', {})
         require(isinstance(templates, dict), 'Некорректный каталог шаблонов ОС')
@@ -428,6 +517,7 @@ class Engine:
         return f'virtio={self.mac(row, 1)},bridge={self.c["public_network"]["bridge"]},firewall=0' + (',link_down=1' if down else '')
 
     def isolate_public(self, row):
+        self.assert_mutable(row)
         lease = self.ipam.for_order(row['order_id'], row['client_id'])
         if not lease:
             return
@@ -441,6 +531,7 @@ class Engine:
         self.ipam.release_assigned(row['order_id'], row['client_id'], lease['id'], isolated=True)
 
     def restore_public(self, row):
+        self.assert_mutable(row)
         spec = json.loads(row['spec'])
         vmid = self.vmid(row)
         try:
@@ -473,6 +564,7 @@ class Engine:
                 'Заказ удалён; повторная выдача запрещена')
         row = self.db.execute('SELECT * FROM allocation WHERE order_id=?', (order,)).fetchone()
         if row:
+            self.assert_mutable(row)
             require(row['client_id'] == client and json.loads(row['spec']) == spec,
                     'Заказ уже закреплён за другим клиентом, тарифом или SSH-ключом')
             return row
@@ -480,8 +572,10 @@ class Engine:
         self.template(spec.get('os', DEFAULT_OS))
         used = {r[0] for r in self.db.execute('SELECT slot FROM allocation')}
         guests = self.pve.guests()
+        infrastructure = self.infrastructure_registry()
         ips = declared_ips(self.pve, self.c['node'])
         slots = [i for i in range(self.c['slots']) if i not in used and self.c['vm_first'] + i not in guests
+                 and self.c['vm_first'] + i not in infrastructure
                  and str(ipaddress.ip_address(self.c['ip_first']) + i) not in ips]
         require(slots, 'Нет свободных слотов VPS; отменённые слоты не переиспользуются')
         credential = self.new_password(order, client) if spec['ssh_key'] is None else None
@@ -517,6 +611,7 @@ class Engine:
         return cipher.encrypt(value), hashed
 
     def initial_password(self, row):
+        self.assert_mutable(row)
         require(row['phase'] == 'ready' and self.pve.status(self.vmid(row)) == 'running',
                 'Пароль доступен только у активного VPS')
         require(not self.pending_restart(row), 'Перезагрузка VPS ещё не завершена')
@@ -538,6 +633,7 @@ class Engine:
         return {'user': 'vpsadmin', 'password': value['password']}
 
     def phase(self, row, value):
+        self.assert_mutable(row)
         self.db.execute('UPDATE allocation SET phase=? WHERE order_id=?', (value, row['order_id']))
         if value in RESTART_SUPERSEDING_PHASES:
             self.db.execute("UPDATE owner_restart SET state='interrupted' WHERE order_id=? AND state='dispatched'", (row['order_id'],))
@@ -581,6 +677,7 @@ class Engine:
             require(int(storage['avail']) >= (plan['disk_gb'] + 5) * 1073741824, 'Недостаточно места на диске')
 
     def stop_vm(self, row):
+        self.assert_mutable(row)
         vmid = self.vmid(row)
         self.pve.command('set', vmid, '--onboot', '0')
         if self.pve.status(vmid) == 'running':
@@ -592,6 +689,7 @@ class Engine:
                 self.pve.command('stop', vmid)
 
     def power(self, row, start, phase=None):
+        self.assert_mutable(row)
         self.owned_config(row)
         if start:
             lease = self.ipam.for_order(row['order_id'], row['client_id'])
@@ -621,6 +719,7 @@ class Engine:
         return public_ready
 
     def owner_restart(self, row, request):
+        self.assert_mutable(row)
         value = request.get('operation_id')
         require(isinstance(value, str), 'Нужен UUID операции')
         try:
@@ -668,6 +767,7 @@ class Engine:
         return result
 
     def admin(self, row, request):
+        self.assert_mutable(row)
         command = request.get('command')
         require(command in ('start', 'stop', 'block', 'unblock', 'archive', 'restore', 'purge'), 'Недопустимая операция')
         try:
@@ -704,6 +804,7 @@ class Engine:
         return result
 
     def admin_effect(self, row, command, request):
+        self.assert_mutable(row)
         phase = row['phase']
         if command == 'purge':
             require(type(request.get('confirm_vmid')) is int and request['confirm_vmid'] == self.vmid(row),
@@ -768,6 +869,7 @@ class Engine:
         return self.info(row)
 
     def create(self, row):
+        self.assert_mutable(row)
         require(row['phase'] != 'cancelled', 'Заказ отменён; диск сохранён, новая активация запрещена')
         require(row['phase'] in ('reserved', 'configured', 'ready'), 'Повторная активация запрещена состоянием VPS')
         vmid, spec = self.vmid(row), json.loads(row['spec'])
@@ -848,6 +950,11 @@ class Engine:
         return self.info(row)
 
     def info(self, row, *, guests=None, configs=None):
+        infrastructure = self.infrastructure_registry().get(self.vmid(row))
+        if infrastructure:
+            self.infrastructure_info(infrastructure,
+                                     guests=self.pve.guests() if guests is None else guests,
+                                     configs={self.vmid(row): self.pve.config(self.vmid(row))} if configs is None else configs)
         current_row = self.db.execute('SELECT * FROM allocation WHERE order_id=?', (row['order_id'],)).fetchone()
         current = current_row['phase'] if current_row else 'deleted'
         reason = current_row['reason'] if current_row else row['reason']
@@ -874,7 +981,8 @@ class Engine:
         endpoint = ownership == 'owned' and current not in ('archived', 'archiving', 'deleted', 'cancelled', 'missing')
         host = lease['address'] if public and lease and endpoint else None if public else self.c['public_ip']
         port = 22 if public and host else 0 if public else self.c['ssh_port_first'] + row['slot']
-        return {'network_mode': 'public_ipv4' if public else 'nat', 'lease_id': lease['id'] if lease else None,
+        return {'infrastructure': infrastructure is not None,
+                'network_mode': 'public_ipv4' if public else 'nat', 'lease_id': lease['id'] if lease else None,
                 'lease_generation': lease['generation'] if lease else None,
                 'vmid': self.vmid(row), 'public_ip': host,
                 'private_ip': str(ipaddress.ip_address(self.c['ip_first']) + row['slot']),
@@ -898,6 +1006,9 @@ class Engine:
             def check_identity():
                 snapshot = reader.identity()
                 require(isinstance(snapshot, dict), 'Некорректная конфигурация метрик')
+                infrastructure = self.infrastructure_registry().get(vmid)
+                if infrastructure:
+                    self.infrastructure_config(infrastructure, snapshot.get('guest'), snapshot.get('config'))
                 self.owned_config(row, guests={vmid: snapshot.get('guest')},
                                   configs={vmid: snapshot.get('config')})
             check_identity()
@@ -933,6 +1044,9 @@ class Engine:
         guests = self.pve.guests()
         configs = self.pve.current_configs(self.c['node'])
         qemu_configs = {guest['vmid']: guest['config'] for guest in configs if guest['type'] == 'qemu'}
+        registry = self.infrastructure_registry()
+        infrastructure = [self.infrastructure_info(entry, guests=guests, configs=qemu_configs)
+                          for entry in registry.values()]
         excluded = set()
         servers = []
         rows = list(self.db.execute('SELECT * FROM allocation')) + list(self.db.execute('SELECT * FROM retired_allocation'))
@@ -962,6 +1076,7 @@ class Engine:
         occupied = {r['slot'] for r in self.db.execute('SELECT slot FROM allocation')}
         ips = declared_ips(self.pve, self.c['node'], configs=configs)
         free_slots = sum(i not in occupied and self.c['vm_first'] + i not in guests
+                         and self.c['vm_first'] + i not in registry
                          and str(ipaddress.ip_address(self.c['ip_first']) + i) not in ips
                          for i in range(self.c['slots']))
         host = {'node': self.c['node'], 'cpuFraction': node_sample.get('cpu'), 'cpuCores': node.get('cpuinfo', {}).get('cpus'),
@@ -969,13 +1084,16 @@ class Engine:
                 'memoryReservedBytes': sum(int(v.get('maxmem', 0)) for v in reserved),
                 'vcpuReserved': sum(int(v.get('maxcpu', 0)) for v in reserved), 'storageUsedBytes': storage.get('used'),
                 'storageTotalBytes': storage['total'], 'storageFreeBytes': storage['avail'], 'slotsFree': free_slots}
-        return {'hosts': [host], 'servers': servers, 'publicIpv4': self.ipam.capacity(ips)}
+        return {'hosts': [host], 'servers': servers, 'infrastructure': infrastructure,
+                'publicIpv4': self.ipam.capacity(ips)}
 
     def handle(self, request):
         require(isinstance(request, dict), 'Ожидается JSON object')
         action = request.get('action')
         require(action in ('create', 'status', 'readiness', 'password', 'suspend', 'unsuspend', 'cancel',
-                           'owner_start', 'owner_stop', 'owner_restart', 'admin', 'monitor', 'metrics', 'network_capacity', 'network_reserve', 'network_payment_pending', 'network_release_hold'), 'Недопустимая операция')
+                           'owner_start', 'owner_stop', 'owner_restart', 'mutation_guard', 'admin', 'monitor', 'metrics', 'network_capacity', 'network_reserve', 'network_payment_pending', 'network_release_hold'), 'Недопустимая операция')
+        # A present but invalid root registry must never silently remove protection.
+        self.infrastructure_registry()
         if action.startswith('network_'):
             try:
                 if action == 'network_capacity':
@@ -995,6 +1113,14 @@ class Engine:
         order, client = request.get('order_id'), request.get('client_id')
         require(type(order) is int and 1 <= order < 2147483647 and type(client) is int and 1 <= client < 2147483647,
                 'Нужны целочисленные order_id и client_id')
+        if action == 'mutation_guard':
+            row = self.db.execute('SELECT * FROM allocation WHERE order_id=?', (order,)).fetchone()
+            if row is None:
+                row = self.db.execute('SELECT * FROM retired_allocation WHERE order_id=?', (order,)).fetchone()
+            if row is not None:
+                require(row['client_id'] == client, 'VPS этого клиента не найден')
+                self.assert_mutable(row)
+            return {'mutable': True}
         if action == 'create':
             os_name = selected_os(request.get('os'))
             require(request.get('plan') in self.c['plans'], 'Неизвестный тариф')
@@ -1032,6 +1158,8 @@ class Engine:
         if action == 'cancel' and row is None:
             return {'phase': 'cancelled', 'status': 'stopped'}
         require(row is not None and row['client_id'] == client, 'VPS этого клиента не найден')
+        if action not in ('status', 'readiness', 'metrics'):
+            self.assert_mutable(row)
         if action == 'metrics':
             return self.metrics(row, request.get('timeframe'))
         if action == 'cancel' and row['phase'] == 'deleted':
@@ -1081,9 +1209,13 @@ def main():
     request = json.loads(raw)
     require(isinstance(request, dict), 'Ожидается JSON object')
     with (state / 'operation.lock').open('a') as lock:
-        read_only = request.get('action') in ('status', 'readiness', 'password', 'monitor', 'metrics', 'network_capacity')
+        read_only = request.get('action') in ('status', 'readiness', 'password', 'monitor', 'metrics', 'mutation_guard', 'network_capacity')
+        # A pre-effect guard must wait for source cutover, rather than turn lock
+        # contention into a terminal policy denial in the financial/admin queue.
+        lock_mode = fcntl.LOCK_SH if request.get('action') == 'mutation_guard' else (
+            fcntl.LOCK_SH | fcntl.LOCK_NB if read_only else fcntl.LOCK_EX)
         try:
-            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB if read_only else fcntl.LOCK_EX)
+            fcntl.flock(lock, lock_mode)
         except BlockingIOError as exc:
             raise Refused('Выполняется изменение VPS; повторите запрос') from exc
         is_metrics = request.get('action') == 'metrics'

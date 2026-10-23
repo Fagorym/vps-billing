@@ -218,6 +218,16 @@ class CLILockingContracts(unittest.TestCase):
         self.assertFalse(completed)
         self.assertEqual(outcome, [None])
 
+    def test_finance_mutation_guard_waits_for_cutover_instead_of_denying_operation(self):
+        completed, outcome = self.invoke_while_locked(fcntl.LOCK_EX, 'mutation_guard')
+        self.assertFalse(completed, 'Temporary cutover contention became a permanent policy refusal')
+        self.assertEqual(outcome, [None])
+
+    def test_finance_mutation_guard_shares_an_existing_read_lock(self):
+        completed, outcome = self.invoke_while_locked(fcntl.LOCK_SH, 'mutation_guard')
+        self.assertTrue(completed)
+        self.assertEqual(outcome, [None])
+
 
 class CLIContracts(unittest.TestCase):
     def test_cloudinit_update_uses_nested_qm_subcommand(self):
