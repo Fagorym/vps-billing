@@ -56,6 +56,7 @@ class PublicEngineTests(unittest.TestCase):
         first = self.handle('create', **request)
         self.assertEqual(guarded, [(1, lease['id'])])
         self.assertEqual([call[1] for call in self.pve.calls if call[0] == 'clone'], [9003])
+
         calls = list(self.pve.calls)
         self.assertEqual(self.handle('create', **request), first)
         with self.assertRaises(engine.Refused):
@@ -69,6 +70,17 @@ class PublicEngineTests(unittest.TestCase):
         self.assertEqual((restored['phase'], restored['vmid']), ('ready', first['vmid']))
         self.assertEqual(json.loads(self.e.db.execute('SELECT spec FROM allocation').fetchone()[0])['os'], 'Debian 13')
         self.assertEqual([call[1] for call in self.pve.calls if call[0] == 'clone'], [9003])
+
+    def test_public_alma_restore_passes_frozen_os_to_guest_readiness(self):
+        fixtures.EngineTests.add_os_templates(self)
+        lease = self.e.handle({'action': 'network_reserve', 'os': 'AlmaLinux 10', **self.network})
+        created = self.handle('create', network_mode='public_ipv4', lease_id=lease['id'], os='AlmaLinux 10', **self.network)
+        context = {'reason': 'Alma SELinux readiness after restore', 'actor': {'account': ACCOUNT, 'email': 'operator@example.test'}}
+        self.handle('admin', command='archive', operation_id=str(uuid.uuid4()), **context)
+        with patch.object(self.pve, 'ready', return_value=True) as ready:
+            restored = self.handle('admin', command='restore', operation_id=str(uuid.uuid4()), **context)
+        self.assertEqual(restored['phase'], 'ready')
+        ready.assert_called_once_with(created['vmid'], created['private_ip'], 'AlmaLinux 10')
 
     def test_native_capacity_reads_canonical_network_configs_in_one_process(self):
         configs=[{'type':'qemu','config':{'ipconfig0':'ip=198.51.100.3/29','net0':'ip=198.51.100.8/29'}},

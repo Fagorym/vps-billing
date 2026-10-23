@@ -107,7 +107,7 @@ denied(fn()=>$osBridge->handle(array_merge($osRequest,['os'=>'Ubuntu 24.04'])),D
 assertPortal($osFoss->orders===1&&$osFoss->activations===0);
 $created=$osBridge->handle($osRequest);assertPortal($created===$osBridge->handle($osRequest));
 assertPortal($osFoss->configs[1]===['disk_gb'=>20,'network_mode'=>'nat','lease_id'=>null,'account'=>$account,'reference'=>$reference,'os'=>'Debian 13']);
-foreach(['Ubuntu 24.04','Ubuntu 22.04','Ubuntu 26.04','Debian 13'] as $index=>$os){
+foreach(['Ubuntu 24.04','Ubuntu 22.04','Ubuntu 26.04','Debian 13','Debian 12','AlmaLinux 9','AlmaLinux 10'] as $index=>$os){
  $reference=sprintf('77777777-7777-4777-8777-%012d',$index);
  $request=array_merge($osRequest,['reference'=>$reference,'os'=>$os]);$created=$osBridge->handle($request);
  assertPortal($osFoss->configs[$created['order_id']]['os']===$os&&$created===$osBridge->handle($request));

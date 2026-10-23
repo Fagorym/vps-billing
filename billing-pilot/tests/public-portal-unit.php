@@ -16,7 +16,7 @@ $f=new PublicFoss();$b=new PortalBridge($f,$directory);
 $r=['account'=>'11111111-1111-4111-8111-111111111111','reference'=>'22222222-2222-4222-8222-222222222222','plan'=>'mini','disk_gb'=>25,'network_mode'=>'public_ipv4','os'=>'Debian 13'];
 $lease=$b->handle($r+['action'=>'network_reserve']);check($lease['address']==='198.51.100.3');
 check($f->networkCalls===[['action'=>'network_reserve','account'=>$r['account'],'reference'=>$r['reference'],'os'=>'Debian 13']]);
-try{$b->handle(array_merge($r,['action'=>'network_reserve','os'=>'Debian 12']));throw new RuntimeException('Unknown OS reserved a lease');}catch(InvalidArgumentException $expected){}
+try{$b->handle(array_merge($r,['action'=>'network_reserve','os'=>'UnknownOS 99']));throw new RuntimeException('Unknown OS reserved a lease');}catch(InvalidArgumentException $expected){}
 check(count($f->networkCalls)===1);
 try{$b->handle($r+['action'=>'create']);throw new RuntimeException('Missing lease was accepted');}catch(InvalidArgumentException $expected){}
 $db=new PDO('sqlite:'.$directory.'/portal.sqlite');

@@ -26,7 +26,8 @@ $order = ['id'=>17, 'client_id'=>23, 'status'=>'pending_setup'];
 $data = ['disk_gb'=>60, 'ssh_key'=>'ssh-ed25519 example', 'network_mode'=>'public_ipv4',
     'lease_id'=>'11111111-1111-4111-8111-111111111111', 'account'=>'22222222-2222-4222-8222-222222222222',
     'reference'=>'33333333-3333-4333-8333-333333333333'];
-foreach (['Ubuntu 24.04', 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13'] as $os) {
+$operatingSystems = ['Ubuntu 24.04', 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13', 'Debian 12', 'AlmaLinux 9', 'AlmaLinux 10'];
+foreach ($operatingSystems as $os) {
     adapterCheck($adapter->activate($data+['os'=>$os], $order));
     adapterCheck(end($outgoing) === ['plan'=>'small', 'disk_gb'=>60, 'os'=>$os, 'ssh_key'=>'ssh-ed25519 example',
         'network_mode'=>'public_ipv4', 'lease_id'=>$data['lease_id'], 'account'=>$data['account'],
@@ -43,7 +44,7 @@ adapterCheck(count($outgoing) === $count);
 $gateway->deny = false;
 try { $adapter->activate($data, $order, ['method'=>'activate', 'order_id'=>17]);throw new LogicException('Custom lifecycle call accepted'); }
 catch (\FOSSBilling\InformationException $expected) {}
-adapterCheck(count($outgoing) === $count && count($gateway->calls) === 6);
+adapterCheck(count($outgoing) === $count && count($gateway->calls) === count($operatingSystems) + 2);
 $db = new class {
     public ?object $existing = null;
     public function getExistingModelById(string $model, int $id): object { return (object)['id'=>$id]; }
@@ -55,7 +56,7 @@ $api = new class {
 };
 $catalog = json_decode(file_get_contents('/var/www/html/data/pilot-catalog.json'), true, 512, JSON_THROW_ON_ERROR);
 $foss = new FossPortal(['db'=>$db, 'api_admin'=>$api]);
-foreach (['Ubuntu 24.04', 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13'] as $os) {
+foreach ($operatingSystems as $os) {
     $config = $data;unset($config['ssh_key']);$config['os'] = $os;
     $foss->order(23, $data['reference'], 'small', $config);
     adapterCheck(end($api->calls) === ['client_id'=>23, 'product_id'=>(int)$catalog['products']['small'], 'period'=>'1M',
@@ -66,6 +67,6 @@ $foss->order(23, $data['reference'], 'small');
 adapterCheck(end($api->calls)['config'] === ['ssh_key'=>'', 'os'=>'Ubuntu 24.04']);
 $db->existing = (object)['id'=>91, 'product_id'=>$catalog['products']['small'], 'price'=>0, 'config'=>'historic'];
 adapterCheck($foss->order(23, $data['reference'], 'small', ['os'=>'Debian 13']) === 91);
-adapterCheck(count($api->calls) === 5 && $db->existing->config === 'historic');
+adapterCheck(count($api->calls) === count($operatingSystems) + 1 && $db->existing->config === 'historic');
 echo "PASS: adapter full OS/SSD/network/owner create payload, legacy defaults, financial and lifecycle guards\n";
 }

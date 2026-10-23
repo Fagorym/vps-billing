@@ -98,7 +98,8 @@ final class PortalBridge
         }
         $os = $r['os'] ?? 'Ubuntu 24.04';
         if (in_array($r['action'], ['create', 'network_reserve'], true)
-            && !in_array($os, ['Ubuntu 24.04', 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13'], true)) {
+            && !in_array($os, ['Ubuntu 24.04', 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13',
+                             'Debian 12', 'AlmaLinux 9', 'AlmaLinux 10'], true)) {
             throw new InvalidArgumentException('Invalid operating system');
         }
         if (str_starts_with($r['action'],'network_')) {

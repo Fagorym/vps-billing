@@ -38,7 +38,7 @@ class FakePVE:
         self.crash_after_clone = False
         self.crash_after_start = False
 
-    def ready(self, vmid, ip):
+    def ready(self, vmid, ip, os_name=engine.DEFAULT_OS):
         return self.is_ready
 
     def guests(self):
@@ -219,6 +219,22 @@ class CLIContracts(unittest.TestCase):
             engine.Proxmox({}).cloudinit_update(1100)
         command.assert_called_once_with(['/usr/sbin/qm', 'cloudinit', 'update', '1100'])
 
+    def test_readiness_uses_selinux_entrypoint_only_for_exact_alma_os(self):
+        cases = {None: [], 'Ubuntu 24.04': [], 'Debian 12': [], 'Debian 13': [],
+                 'AlmaLinux 9 custom': [],
+                 'AlmaLinux 9': ['/usr/local/libexec/safehost-qga-exec'],
+                 'AlmaLinux 10': ['/usr/local/libexec/safehost-qga-exec']}
+        reply = SimpleNamespace(returncode=0, stdout=json.dumps({'exitcode': 0, 'out-data': '{"status":"done"}'}))
+        for os_name, entrypoint in cases.items():
+            with self.subTest(os=os_name), patch.object(engine.subprocess, 'run', return_value=reply) as command, \
+                    patch.object(engine.socket, 'create_connection') as ssh:
+                ssh.return_value.__enter__.return_value.recv.return_value = b'SSH-2.0-OpenSSH'
+                pve = engine.Proxmox({})
+                self.assertTrue(pve.ready(1100, '10.10.10.20') if os_name is None else pve.ready(1100, '10.10.10.20', os_name))
+                command.assert_called_once_with(['/usr/sbin/qm', 'guest', 'exec', '1100', '--timeout', '10', '--',
+                    *entrypoint, 'cloud-init', 'status', '--format', 'json'], capture_output=True, text=True, timeout=15)
+                ssh.assert_called_once_with(('10.10.10.20', 22), timeout=2)
+
 
 class EngineTests(unittest.TestCase):
     def test_readiness_requires_cloud_init_and_ssh_and_owner(self):
@@ -231,6 +247,20 @@ class EngineTests(unittest.TestCase):
             self.handle('readiness', client_id=3)
         self.handle('suspend')
         self.assertFalse(self.handle('readiness')['ready'])
+
+    def test_password_and_readiness_pass_frozen_os_to_guest_probe(self):
+        self.add_os_templates()
+        for order, os_name in enumerate((None, 'AlmaLinux 9', 'AlmaLinux 10'), 1):
+            with self.subTest(os=os_name):
+                request = {'order_id': order, 'ssh_key': ''}
+                if os_name is not None:
+                    request['os'] = os_name
+                created = self.handle('create', **request)
+                for action in ('password', 'readiness'):
+                    with self.subTest(action=action), patch.object(self.pve, 'ready', return_value=True) as ready:
+                        result = self.handle(action, order_id=order, os='Debian 12')
+                        self.assertTrue(result['ready'] if action == 'readiness' else result['password'])
+                        ready.assert_called_once_with(created['vmid'], created['private_ip'], os_name or engine.DEFAULT_OS)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -248,7 +278,8 @@ class EngineTests(unittest.TestCase):
 
     def add_os_templates(self):
         self.config['templates'] = {}
-        for template_id, os_name in enumerate(('Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13'), 9001):
+        for template_id, os_name in enumerate(('Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13',
+                                               'Debian 12', 'AlmaLinux 9', 'AlmaLinux 10'), 9001):
             marker = f'proxmox-pilot:v1:template:test-{template_id}'
             self.config['templates'][os_name] = {'template_id': template_id, 'template_marker': marker}
             self.pve.vms[template_id] = {**self.pve.vms[9000], 'description': marker}
@@ -257,7 +288,9 @@ class EngineTests(unittest.TestCase):
     def test_selected_os_clones_its_owned_template_and_freezes_spec(self):
         self.add_os_templates()
         for order, os_name, template_id in ((1, 'Ubuntu 24.04', 9000), (2, 'Ubuntu 22.04', 9001),
-                                             (3, 'Ubuntu 26.04', 9002), (4, 'Debian 13', 9003)):
+                                             (3, 'Ubuntu 26.04', 9002), (4, 'Debian 13', 9003),
+                                             (5, 'Debian 12', 9004), (6, 'AlmaLinux 9', 9005),
+                                             (7, 'AlmaLinux 10', 9006)):
             with self.subTest(os=os_name):
                 first = self.handle('create', order_id=order, os=os_name, disk_gb=25)
                 row = self.e.db.execute('SELECT * FROM allocation WHERE order_id=?', (order,)).fetchone()
@@ -272,6 +305,19 @@ class EngineTests(unittest.TestCase):
                 with self.assertRaises(engine.Refused):
                     self.handle('create', order_id=order, os='Debian 13' if os_name != 'Debian 13' else 'Ubuntu 24.04', disk_gb=25)
                 self.assertEqual(self.pve.calls, calls)
+
+    def test_alma_creation_uses_wheel_and_retains_initial_password_expiry(self):
+        self.add_os_templates()
+        for order, os_name in enumerate(('AlmaLinux 9', 'AlmaLinux 10'), 1):
+            with self.subTest(os=os_name):
+                server = self.handle('create', order_id=order, os=os_name, ssh_key=None)
+                snippet = Path(self.temp.name) / 'snippets' / f'safehost-billing-{server["vmid"]}.yaml'
+                cloud = json.loads(snippet.read_text().split('\n', 1)[1])
+                self.assertEqual(cloud['users'][0]['groups'], ['wheel'])
+                self.assertEqual(cloud['users'][0]['sudo'], 'ALL=(ALL) NOPASSWD:ALL')
+                self.assertTrue(cloud['chpasswd']['expire'])
+                self.assertIn(['chage', '-d', '0', 'vpsadmin'], cloud['runcmd'])
+                self.assertTrue(cloud['disable_root'])
 
     def test_default_os_replays_historic_spec_without_template_or_mutation(self):
         first = self.handle('create')
@@ -301,7 +347,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.pve.calls, calls)
 
     def test_invalid_or_unavailable_os_fails_before_allocation_and_credentials(self):
-        for os_name in ('Debian 13', 'Ubuntu 22.04', 'Ubuntu 26.04', 'Ubuntu 20.04', '', 13, {}):
+        for os_name in ('Debian 13', 'Debian 12', 'AlmaLinux 9', 'AlmaLinux 10',
+                        'Ubuntu 22.04', 'Ubuntu 26.04', 'Ubuntu 20.04', '', 13, {}):
             with self.subTest(os=os_name), self.assertRaises(engine.Refused):
                 self.handle('create', os=os_name, ssh_key='')
         self.add_os_templates()

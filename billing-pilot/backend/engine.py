@@ -26,7 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ipam import Ipam, Refused as IpamRefused
 
 DEFAULT_OS = 'Ubuntu 24.04'
-SUPPORTED_OS = (DEFAULT_OS, 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13')
+SUPPORTED_OS = (DEFAULT_OS, 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13',
+                'Debian 12', 'AlmaLinux 9', 'AlmaLinux 10')
 
 
 class Refused(ValueError):
@@ -224,10 +225,13 @@ print encode_json(\@rows);
     def resize(self, vmid, gb):
         run(['/usr/sbin/qm', 'disk', 'resize', str(vmid), 'scsi0', str(gb) + 'G'])
 
-    def ready(self, vmid, ip):
+    def ready(self, vmid, ip, os_name=DEFAULT_OS):
         try:
+            command = ['cloud-init', 'status', '--format', 'json']
+            if os_name in ('AlmaLinux 9', 'AlmaLinux 10'):
+                command.insert(0, '/usr/local/libexec/safehost-qga-exec')
             result = subprocess.run(['/usr/sbin/qm', 'guest', 'exec', str(vmid), '--timeout', '10',
-                                     '--', 'cloud-init', 'status', '--format', 'json'],
+                                     '--', *command],
                                     capture_output=True, text=True, timeout=15)
             if result.returncode != 0:
                 return False
@@ -419,7 +423,8 @@ class Engine:
             if self.pve.status(vmid) != 'running':
                 self.pve.command('start', vmid)
             self.pve.apply_public_network(row, lease, self.c)
-            require(self.pve.ready(vmid, str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])) and self.pve.public_ready(lease['address']), 'Сеть восстанавливаемой VM ещё не готова')
+            require(self.pve.ready(vmid, str(ipaddress.ip_address(self.c['ip_first']) + row['slot']), spec.get('os', DEFAULT_OS))
+                    and self.pve.public_ready(lease['address']), 'Сеть восстанавливаемой VM ещё не готова')
             self.pve.command('set', vmid, '--onboot', '1')
             self.phase(row, 'ready')
         except (ValueError, OSError, subprocess.SubprocessError) as error:
@@ -481,10 +486,11 @@ class Engine:
     def initial_password(self, row):
         require(row['phase'] == 'ready' and self.pve.status(self.vmid(row)) == 'running',
                 'Пароль доступен только у активного VPS')
-        require(json.loads(row['spec'])['ssh_key'] is None, 'Этот VPS использует SSH-ключ')
+        spec = json.loads(row['spec'])
+        require(spec['ssh_key'] is None, 'Этот VPS использует SSH-ключ')
         ip = str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])
-        require(self.pve.ready(self.vmid(row), ip), 'SSH ещё не готов; повторите запрос')
-        if json.loads(row['spec']).get('network_mode') == 'public_ipv4':
+        require(self.pve.ready(self.vmid(row), ip, spec.get('os', DEFAULT_OS)), 'SSH ещё не готов; повторите запрос')
+        if spec.get('network_mode') == 'public_ipv4':
             lease = self.ipam.for_order(row['order_id'], row['client_id'])
             require(lease and self.pve.public_ready(lease['address']), 'Публичный SSH ещё не готов')
         credential = self.db.execute('SELECT encrypted FROM credential WHERE order_id=?', (row['order_id'],)).fetchone()
@@ -693,8 +699,9 @@ class Engine:
         require(self.pve.status(vmid) == 'stopped', 'Незавершённая VM запущена; нужна проверка администратором')
         require('scsi0' in cfg, 'Клонирование не завершено; проверьте задачу Proxmox')
         ip = str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])
+        alma = selected_os(spec.get('os')) in ('AlmaLinux 9', 'AlmaLinux 10')
         cloud = {'hostname': f'vps-order-{row["order_id"]}', 'manage_etc_hosts': True,
-                 'users': [{'name': 'vpsadmin', 'groups': ['adm', 'sudo'], 'shell': '/bin/bash',
+                 'users': [{'name': 'vpsadmin', 'groups': ['wheel'] if alma else ['adm', 'sudo'], 'shell': '/bin/bash',
                             'sudo': 'ALL=(ALL) NOPASSWD:ALL', 'lock_passwd': True,
                             'ssh_authorized_keys': [spec['ssh_key']]}],
                  'disable_root': True, 'ssh_pwauth': False, 'package_update': True,
@@ -932,8 +939,9 @@ class Engine:
         if action in ('status', 'readiness'):
             info = self.info(row)
             if action == 'readiness':
+                os_name = json.loads(row['spec']).get('os', DEFAULT_OS)
                 info['ready'] = (info['ownership'] == 'owned' and info['phase'] == 'ready' and info['status'] == 'running'
-                                 and self.pve.ready(self.vmid(row), info['private_ip'])
+                                 and self.pve.ready(self.vmid(row), info['private_ip'], os_name)
                                  and (info['network_mode'] != 'public_ipv4' or info['public_ip'] is not None and self.pve.public_ready(info['public_ip'])))
             return info
         if action == 'admin':
