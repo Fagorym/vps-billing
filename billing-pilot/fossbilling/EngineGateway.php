@@ -6,7 +6,7 @@ final class EngineGateway
 {
     private function request(array $payload): array
     {
-        $metrics = in_array($payload['action'] ?? '', ['metrics','infrastructure_metrics','infrastructure_disk'], true);
+        $metrics = in_array($payload['action'] ?? '', ['metrics','infrastructure_metrics','infrastructure_disk','infrastructure_disk_history'], true);
         $argv = ['/usr/bin/ssh', '-T', '-i', '/run/proxmox/id_ed25519', '-o', 'IdentitiesOnly=yes',
             '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=/run/proxmox/known_hosts',
             '-o', 'ConnectTimeout='.($metrics ? '3' : '10'), '-o', 'ServerAliveInterval='.($metrics ? '5' : '15'), '-o', 'ServerAliveCountMax=3', 'root@10.10.10.1'];
@@ -73,6 +73,10 @@ final class EngineGateway
     public function infrastructureDisk(string $account, int $vmid, string $node): array
     {
         return $this->request(['action'=>'infrastructure_disk', 'account'=>$account, 'vmid'=>$vmid, 'node'=>$node]);
+    }
+    public function infrastructureDiskHistory(string $account, int $vmid, string $node, string $timeframe): array
+    {
+        return $this->request(['action'=>'infrastructure_disk_history', 'account'=>$account, 'vmid'=>$vmid, 'node'=>$node, 'timeframe'=>$timeframe]);
     }
     public function state(int $client,int $order): array
     {

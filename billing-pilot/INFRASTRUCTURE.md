@@ -121,3 +121,33 @@ owner start/stop, suspend/unsuspend/cancel, все admin-команды, native 
 Сначала обновляют engine, затем billing image/adapter и admin-worker, затем
 устанавливают проверенный реестр. Read endpoint и dashboard проверяют после
 установки. Существующие заказы, платежи и архивы не удаляются.
+
+История root filesystem собирается только отдельным root collector через
+`safehost-infrastructure-disk.timer` раз в UTC-минуту (`Persistent=false`).
+Collector использует standalone `InfrastructureObserver(state,pve)` и никогда
+не создаёт Engine/allocator connection. Он берёт shared nonblocking operation
+lock до чтения config/seal, отдельный collector lock и общий deadline15s; QGA
+ограничен3s. Фиксированный allowlist collector —101/1101. Новые registry VMID
+автоматически не собираются. Поздний результат, пересёкший минутную границу,
+отбрасывается; повтор одной минуты не заменяет первый sample.
+
+Отдельный store `/var/lib/safehost-monitoring/infrastructure-disk.sqlite3`
+содержит восемь дней минутных snapshots с ключом
+`account,vmid,node,configSha256,timestamp`. Каталог root0700, DB/WAL/SHM/lock
+root0600, symlinks запрещены. Только collector создаёт/пишет/prune store.
+Исторические финансовые данные, allocations и оба root-реестра не меняются.
+
+`infrastructure_disk_history` принимает actor,vmid,node,timeframe:day|week;
+engine payload содержит только action,account,vmid,node,timeframe. Чтение идёт
+через Observer до создания Engine, с config seal и registry/config identity
+до/после readonly SQL. QGA и RRD history при этом не вызываются. Store открывается
+`mode=ro`; отсутствующий store не создаётся. Ответ:
+`{vmid,node,account,mountpoint:"/",timeframe,start,end,step:60,points:[{timestamp,usedBytes,totalBytes}]}`.
+`end` — текущая UTC-минута, `start=end-duration`; ticks `(start,end]` дают ровно
+1440/10080 точек. Пропуск/ошибка/время до первого sample представлены null-парой;
+нет backfill, interpolation, усреднения или переноса последнего значения.
+Неделя с максимальными safe-int значениями укладывается в transport limit1MiB.
+
+Ansible воспроизводимо копирует оба новых модуля перед engine и unit definitions,
+но не включает timer. Scoped rollout включает его только после source/API/store
+preflight; rollback отключает timer и сохраняет monitoring DB без delete/restore.

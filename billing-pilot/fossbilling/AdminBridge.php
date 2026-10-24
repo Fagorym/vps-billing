@@ -76,6 +76,7 @@ final class AdminBridge
             'infrastructure' => $this->locked(false, fn() => $this->infrastructure($actor)),
             'infrastructure_metrics' => $this->infrastructureMetrics($r, $actor),
             'infrastructure_disk' => $this->infrastructureDisk($r, $actor),
+            'infrastructure_disk_history' => $this->infrastructureDiskHistory($r, $actor),
             'action' => $this->enqueue($r, $actor),
             'operation' => $this->operation(self::uuid($r['operationId'] ?? null)),
             default => throw new InvalidArgumentException('Invalid action'),
@@ -143,12 +144,21 @@ final class AdminBridge
         self::infrastructureTarget($request);
         return $this->engine->infrastructureDisk($actor['account'], $request['vmid'], $request['node']);
     }
+    private static function infrastructurePeriod(array $request): string
+    {
+        $validPeriod = in_array($request['timeframe'] ?? null, ['day','week'], true);
+        if (!$validPeriod) { throw new InvalidArgumentException('Invalid infrastructure period'); }
+        return $request['timeframe'];
+    }
+    private function infrastructureDiskHistory(array $request, array $actor): array
+    {
+        self::infrastructureTarget($request);
+        return $this->engine->infrastructureDiskHistory($actor['account'], $request['vmid'], $request['node'], self::infrastructurePeriod($request));
+    }
     private function infrastructureMetrics(array $request, array $actor): array
     {
         self::infrastructureTarget($request);
-        $validPeriod = in_array($request['timeframe'] ?? null, ['day','week'], true);
-        if (!$validPeriod) { throw new InvalidArgumentException('Invalid infrastructure metrics request'); }
-        return $this->engine->infrastructureMetrics($actor['account'], $request['vmid'], $request['node'], $request['timeframe']);
+        return $this->engine->infrastructureMetrics($actor['account'], $request['vmid'], $request['node'], self::infrastructurePeriod($request));
     }
     private static function infrastructureServer(array $row, array $maps, int $orderId = 0, ?string $createdAt = null): array
     {

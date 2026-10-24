@@ -36,7 +36,20 @@
         owner: root
         group: root
         mode: '0644'
-      loop: [ipam.py, guest_network.py, network_boot.py, network_migrate.py, expand_pool.py]
+      loop: [ipam.py, guest_network.py, network_boot.py, network_migrate.py, expand_pool.py, infrastructure_observer.py, infrastructure_disk_history.py]
+
+    - name: Сохранить minute collector units без включения до отдельного preflight
+      ansible.builtin.copy:
+        src: "{{ billing_root }}/systemd/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: [safehost-infrastructure-disk.service, safehost-infrastructure-disk.timer]
+
+    - name: Перечитать unit definitions без запуска collector
+      ansible.builtin.systemd_service:
+        daemon_reload: true
 
     - name: Обновить ограниченный адаптер
       ansible.builtin.copy:

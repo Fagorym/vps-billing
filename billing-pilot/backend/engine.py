@@ -25,28 +25,14 @@ import uuid
 from cryptography.fernet import Fernet, InvalidToken
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ipam import Ipam, Refused as IpamRefused
+from infrastructure_observer import (InfrastructureObserver, Refused, require, selected_os,
+                                     fingerprint, metrics_deadline, DEFAULT_OS, SUPPORTED_OS)
+# Load dependencies before operation.lock so imported requests remain valid during rollback.
+from infrastructure_disk_history import DiskHistory
 
-DEFAULT_OS = 'Ubuntu 24.04'
-SUPPORTED_OS = (DEFAULT_OS, 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13',
-                'Debian 12', 'AlmaLinux 9', 'AlmaLinux 10')
-METRICS_ACTIONS = ('metrics', 'infrastructure_metrics', 'infrastructure_disk')
+METRICS_ACTIONS = ('metrics', 'infrastructure_metrics', 'infrastructure_disk', 'infrastructure_disk_history')
 RESTART_SUPERSEDING_PHASES = ('stopped', 'suspended', 'blocked', 'archiving', 'archived',
                             'canceling', 'cancelled', 'purging', 'deleted')
-
-
-class Refused(ValueError):
-    pass
-
-
-def require(condition, message):
-    if not condition:
-        raise Refused(message)
-
-
-def selected_os(value):
-    name = DEFAULT_OS if value is None else value
-    require(isinstance(name, str) and name in SUPPORTED_OS, 'Неизвестная операционная система')
-    return name
 
 
 def ssh_key(value):
@@ -64,10 +50,6 @@ def ssh_key(value):
     return 'ssh-ed25519 ' + base64.b64encode(blob).decode('ascii')
 
 
-def fingerprint(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-
-
 def validated_boot_id(value):
     require(isinstance(value, str) and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value),
             'Не удалось проверить запуск VPS')
@@ -79,19 +61,6 @@ def run(args):
     if result.returncode != 0:
         raise OSError('Сбой выполнения команды Proxmox; смотрите журнал хоста')
     return result.stdout
-
-
-@contextmanager
-def metrics_deadline(seconds=15):
-    def expired(signum, frame):
-        raise TimeoutError('Истёк срок получения метрик')
-    previous = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
 
 
 def declared_ips(pve, node, exclude=None, *, configs=None):
@@ -307,7 +276,7 @@ print encode_json(\@rows);
         return None
 
 
-class Engine:
+class Engine(InfrastructureObserver):
     def __init__(self, config, state, snippets, pve=None, *, db_timeout=30):
         self.c = config
         self.state = Path(state)
@@ -356,56 +325,6 @@ class Engine:
     def vmid(self, row):
         return self.c['vm_first'] + row['slot']
 
-    def infrastructure_registry(self):
-        """Root state, independent of the immutable provisioning configuration seal."""
-        path = self.state / 'infrastructure.json'
-        try:
-            metadata = path.lstat()
-        except FileNotFoundError:
-            return {}
-        require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.geteuid()
-                and metadata.st_mode & 0o077 == 0 and metadata.st_size <= 131072,
-                'Небезопасный реестр служебных VM')
-        def unique_fields(pairs):
-            result = {}
-            for key, value in pairs:
-                require(key not in result, 'Повторное поле в реестре служебных VM')
-                result[key] = value
-            return result
-        try:
-            document = json.loads(path.read_text(), object_pairs_hook=unique_fields)
-        except (OSError, ValueError) as exc:
-            raise Refused('Некорректный реестр служебных VM') from exc
-        require(isinstance(document, dict) and set(document) == {'version', 'servers'}
-                and type(document['version']) is int and document['version'] == 1
-                and isinstance(document['servers'], list) and len(document['servers']) <= 100,
-                'Некорректный реестр служебных VM')
-        registry = {}
-        fields = {'vmid', 'node', 'account', 'name', 'os', 'address', 'publicIpv4', 'configSha256'}
-        for entry in document['servers']:
-            require(isinstance(entry, dict) and set(entry) == fields, 'Некорректная служебная VM')
-            require(type(entry['vmid']) is int and 0 < entry['vmid'] < 2147483647
-                    and entry['vmid'] not in registry and isinstance(entry['node'], str)
-                    and entry['node'].strip() and entry['node'] == self.c['node'],
-                    'Некорректный VMID или узел служебной VM')
-            require(isinstance(entry['name'], str) and 1 <= len(entry['name'].strip()) <= 254
-                    and not any(ord(character) < 32 for character in entry['name']),
-                    'Нужно имя служебной VM')
-            require(isinstance(entry['account'], str)
-                    and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', entry['account'])
-                    and uuid.UUID(entry['account']).int != 0, 'Нужен UUID владельца служебной VM')
-            selected_os(entry['os'])
-            require(isinstance(entry['os'], str) and type(entry['publicIpv4']) is bool
-                    and isinstance(entry['configSha256'], str)
-                    and re.fullmatch(r'[0-9a-f]{64}', entry['configSha256']),
-                    'Некорректная идентичность служебной VM')
-            try:
-                require(isinstance(entry['address'], str), 'Нужен IPv4 служебной VM')
-                ipaddress.IPv4Address(entry['address'])
-            except ValueError as exc:
-                raise Refused('Некорректный IPv4 служебной VM') from exc
-            registry[entry['vmid']] = entry
-        return registry
 
     def assert_mutable(self, row):
         require(self.vmid(row) not in self.infrastructure_registry(),
@@ -435,14 +354,6 @@ class Engine:
             'cores': int(cfg['cores']), 'memoryMb': int(cfg['memory']),
             'diskGb': int(disk_gb) if disk_gb.is_integer() else disk_gb, 'observedAt': self.now()}
 
-    @staticmethod
-    def infrastructure_config(entry, guest, cfg):
-        require(isinstance(guest, dict) and guest.get('node') == entry['node']
-                and guest.get('type') == 'qemu' and isinstance(cfg, dict),
-                'Служебная VM отсутствует на заданном узле')
-        require(not cfg.get('template') and not cfg.get('lock')
-                and fingerprint({key: value for key, value in cfg.items() if key != 'digest'}) == entry['configSha256'],
-                'Изменилась защищённая конфигурация служебной VM')
 
     def template(self, os_name):
         templates = self.c.get('templates', {})
@@ -1066,40 +977,6 @@ class Engine:
             entries[vmid] = entry
         return entries
 
-    @staticmethod
-    def owned_infrastructure(registry, account, vmid, node):
-        valid_account = isinstance(account, str) and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', account)
-        valid_vm = type(vmid) is int and 0 < vmid < 2147483647 and isinstance(node, str) and bool(node.strip())
-        require(valid_account and valid_vm, 'Некорректный владелец, VMID или узел служебной VM')
-        entry = registry.get(vmid)
-        owned = entry is not None and entry['account'] == account and entry['node'] == node
-        require(owned, 'Служебная VM этого владельца не найдена')
-        return entry
-
-    def infrastructure_disk(self, account, vmid, node):
-        entry = self.owned_infrastructure(self.infrastructure_registry(), account, vmid, node)
-        result = {key: entry[key] for key in ('vmid', 'node', 'account')}
-        result.update(mountpoint='/', usedBytes=None, totalBytes=None, observedAt=None)
-        with self.pve.metrics_reader(vmid, 'day') as reader:
-            def identity():
-                snapshot = reader.identity()
-                require(isinstance(snapshot, dict), 'Некорректная конфигурация служебной VM')
-                current = self.infrastructure_registry().get(vmid)
-                require(current == entry, 'Изменилась регистрация служебной VM во время чтения диска')
-                self.infrastructure_config(current, snapshot.get('guest'), snapshot.get('config'))
-            identity()
-            try:
-                fs = self.pve.guest_fs(vmid)
-            except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired):
-                fs = None
-            identity()
-        valid_shape = isinstance(fs, (tuple, list)) and len(fs) == 2
-        if valid_shape:
-            used, total = fs
-            valid_bytes = type(used) is int and type(total) is int and 0 <= used <= total and 0 < total <= 2**53 - 1
-            if valid_bytes:
-                result.update(usedBytes=used, totalBytes=total, observedAt=datetime.now(timezone.utc).isoformat())
-        return result
 
     def infrastructure_metrics(self, account, vmid, node, timeframe):
         duration, step = self.metrics_period(timeframe)
@@ -1226,6 +1103,8 @@ class Engine:
                 raise Refused(str(exc)) from exc
         if action == 'monitor':
             return self.monitor()
+        if action == 'infrastructure_disk_history':
+            return self.infrastructure_disk_history(request.get('account'), request.get('vmid'), request.get('node'), request.get('timeframe'))
         if action == 'infrastructure_disk':
             return self.infrastructure_disk(request.get('account'), request.get('vmid'), request.get('node'))
         if action == 'infrastructure_metrics':
@@ -1342,11 +1221,16 @@ def main():
         with metrics_deadline() if is_metrics else nullcontext():
             # Config and its seal are replaced under this same lock during migrations.
             config = json.loads(Path('/etc/safehost-billing/config.json').read_text())
-            engine = Engine(config, state, '/var/lib/vz/snippets', db_timeout=1) if is_metrics else Engine(config, state, '/var/lib/vz/snippets')
-            try:
-                result = engine.handle(request)
-            finally:
-                engine.db.close()
+            if request.get('action') == 'infrastructure_disk_history':
+                require((state / 'config.sha256').read_text().strip() == fingerprint(config), 'Конфигурация пула изменилась')
+                observer = InfrastructureObserver(state, Proxmox(config))
+                result = observer.infrastructure_disk_history(request.get('account'), request.get('vmid'), request.get('node'), request.get('timeframe'))
+            else:
+                engine = Engine(config, state, '/var/lib/vz/snippets', db_timeout=1) if is_metrics else Engine(config, state, '/var/lib/vz/snippets')
+                try:
+                    result = engine.handle(request)
+                finally:
+                    engine.db.close()
     print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))
 
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect Safehost infrastructure root filesystem snapshots
+After=pve-cluster.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 /usr/local/lib/safehost-billing/infrastructure_disk_history.py
+TimeoutStartSec=20

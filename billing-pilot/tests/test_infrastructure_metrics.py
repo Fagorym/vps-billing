@@ -216,7 +216,7 @@ class InfrastructureMetricsTransportTests(unittest.TestCase):
             config.write_text('{}')
             def path(value):
                 return config if value == '/etc/safehost-billing/config.json' else state if value == '/var/lib/safehost-billing' else Path(value)
-            for action in engine.METRICS_ACTIONS:
+            for action in (action for action in engine.METRICS_ACTIONS if action != 'infrastructure_disk_history'):
                 with self.subTest(action=action):
                     fake = SimpleNamespace(db=SimpleNamespace(close=lambda: None), handle=lambda request: {'points': []})
                     with patch.object(engine, 'Path', side_effect=path), patch.object(engine, 'Engine', return_value=fake) as construct, \
