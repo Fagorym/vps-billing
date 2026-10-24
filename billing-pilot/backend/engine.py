@@ -29,7 +29,7 @@ from ipam import Ipam, Refused as IpamRefused
 DEFAULT_OS = 'Ubuntu 24.04'
 SUPPORTED_OS = (DEFAULT_OS, 'Ubuntu 22.04', 'Ubuntu 26.04', 'Debian 13',
                 'Debian 12', 'AlmaLinux 9', 'AlmaLinux 10')
-METRICS_ACTIONS = ('metrics', 'infrastructure_metrics')
+METRICS_ACTIONS = ('metrics', 'infrastructure_metrics', 'infrastructure_disk')
 RESTART_SUPERSEDING_PHASES = ('stopped', 'suspended', 'blocked', 'archiving', 'archived',
                             'canceling', 'cancelled', 'purging', 'deleted')
 
@@ -1066,15 +1066,45 @@ class Engine:
             entries[vmid] = entry
         return entries
 
-    def infrastructure_metrics(self, account, vmid, node, timeframe):
-        duration, step = self.metrics_period(timeframe)
+    @staticmethod
+    def owned_infrastructure(registry, account, vmid, node):
         valid_account = isinstance(account, str) and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', account)
         valid_vm = type(vmid) is int and 0 < vmid < 2147483647 and isinstance(node, str) and bool(node.strip())
         require(valid_account and valid_vm, 'Некорректный владелец, VMID или узел служебной VM')
-        registry = self.infrastructure_registry()
         entry = registry.get(vmid)
         owned = entry is not None and entry['account'] == account and entry['node'] == node
         require(owned, 'Служебная VM этого владельца не найдена')
+        return entry
+
+    def infrastructure_disk(self, account, vmid, node):
+        entry = self.owned_infrastructure(self.infrastructure_registry(), account, vmid, node)
+        result = {key: entry[key] for key in ('vmid', 'node', 'account')}
+        result.update(mountpoint='/', usedBytes=None, totalBytes=None, observedAt=None)
+        with self.pve.metrics_reader(vmid, 'day') as reader:
+            def identity():
+                snapshot = reader.identity()
+                require(isinstance(snapshot, dict), 'Некорректная конфигурация служебной VM')
+                current = self.infrastructure_registry().get(vmid)
+                require(current == entry, 'Изменилась регистрация служебной VM во время чтения диска')
+                self.infrastructure_config(current, snapshot.get('guest'), snapshot.get('config'))
+            identity()
+            try:
+                fs = self.pve.guest_fs(vmid)
+            except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired):
+                fs = None
+            identity()
+        valid_shape = isinstance(fs, (tuple, list)) and len(fs) == 2
+        if valid_shape:
+            used, total = fs
+            valid_bytes = type(used) is int and type(total) is int and 0 <= used <= total and 0 < total <= 2**53 - 1
+            if valid_bytes:
+                result.update(usedBytes=used, totalBytes=total, observedAt=datetime.now(timezone.utc).isoformat())
+        return result
+
+    def infrastructure_metrics(self, account, vmid, node, timeframe):
+        duration, step = self.metrics_period(timeframe)
+        registry = self.infrastructure_registry()
+        entry = self.owned_infrastructure(registry, account, vmid, node)
         observed_now = datetime.now(timezone.utc).timestamp()
         metadata = self.infrastructure_metrics_registry(registry, observed_now).get(vmid)
         require(metadata is not None, 'Не зарегистрирована история служебной VM')
@@ -1196,6 +1226,8 @@ class Engine:
                 raise Refused(str(exc)) from exc
         if action == 'monitor':
             return self.monitor()
+        if action == 'infrastructure_disk':
+            return self.infrastructure_disk(request.get('account'), request.get('vmid'), request.get('node'))
         if action == 'infrastructure_metrics':
             return self.infrastructure_metrics(request.get('account'), request.get('vmid'), request.get('node'), request.get('timeframe'))
         order, client = request.get('order_id'), request.get('client_id')

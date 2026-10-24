@@ -75,6 +75,7 @@ final class AdminBridge
             'dashboard' => $this->locked(false, fn() => $this->dashboard($r)),
             'infrastructure' => $this->locked(false, fn() => $this->infrastructure($actor)),
             'infrastructure_metrics' => $this->infrastructureMetrics($r, $actor),
+            'infrastructure_disk' => $this->infrastructureDisk($r, $actor),
             'action' => $this->enqueue($r, $actor),
             'operation' => $this->operation(self::uuid($r['operationId'] ?? null)),
             default => throw new InvalidArgumentException('Invalid action'),
@@ -131,12 +132,22 @@ final class AdminBridge
         $rows = self::infrastructureRows($this->engine->monitoring());
         return ['servers' => array_values(array_filter($rows, static fn(array $row): bool => $row['account'] === $actor['account']))];
     }
-    private function infrastructureMetrics(array $request, array $actor): array
+    private static function infrastructureTarget(array $request): void
     {
         $validVmid = is_int($request['vmid'] ?? null) && $request['vmid'] > 0 && $request['vmid'] < 2147483647;
         $validNode = is_string($request['node'] ?? null) && preg_match('/^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$/D', $request['node']);
+        if (!$validVmid || !$validNode) { throw new InvalidArgumentException('Invalid infrastructure target'); }
+    }
+    private function infrastructureDisk(array $request, array $actor): array
+    {
+        self::infrastructureTarget($request);
+        return $this->engine->infrastructureDisk($actor['account'], $request['vmid'], $request['node']);
+    }
+    private function infrastructureMetrics(array $request, array $actor): array
+    {
+        self::infrastructureTarget($request);
         $validPeriod = in_array($request['timeframe'] ?? null, ['day','week'], true);
-        if (!$validVmid || !$validNode || !$validPeriod) { throw new InvalidArgumentException('Invalid infrastructure metrics request'); }
+        if (!$validPeriod) { throw new InvalidArgumentException('Invalid infrastructure metrics request'); }
         return $this->engine->infrastructureMetrics($actor['account'], $request['vmid'], $request['node'], $request['timeframe']);
     }
     private static function infrastructureServer(array $row, array $maps, int $orderId = 0, ?string $createdAt = null): array

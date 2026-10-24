@@ -88,6 +88,16 @@ client 16, allocation, описание VM, MAC, адреса и диски со
 metricsSince + размер bucket)`. Allocation/client/order не используются для этой
 истории; полный monitor не вызывается.
 
+`infrastructure_disk` принимает тот же проверенный `actor`, `vmid`, `node` без
+периода и возвращает `{vmid,node,account,mountpoint:"/",usedBytes,totalBytes,observedAt}`.
+Один ограниченный identity reader проверяет регистрацию и Proxmox fingerprint
+до и после существующего QGA `get-fsinfo` (timeout 3 секунды); RRD history и
+полный monitor не вызываются. Доступны только целые числа без boolean:
+`0 <= usedBytes <= totalBytes`, `0 < totalBytes <= 2**53-1`. При недоступном QGA,
+timeout или неверных размерах `usedBytes`, `totalBytes`, `observedAt` равны `null`.
+Нулевой used допустим только при подтверждённом положительном total. Оба root
+реестра остаются неизменными; sidecar истории для чтения диска не требуется.
+
 AdminBridge принимает read action `infrastructure` с обычным проверенным
 `actor`. Ответ `{servers:[...]}` строго ограничен совпадением `actor.account`;
 параметры владельца из запроса не используются. Dashboard помечает строки
