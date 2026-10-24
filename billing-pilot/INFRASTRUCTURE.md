@@ -124,16 +124,21 @@ owner start/stop, suspend/unsuspend/cancel, все admin-команды, native 
 
 История root filesystem собирается только отдельным root collector через
 `safehost-infrastructure-disk.timer` раз в UTC-минуту (`Persistent=false`).
-Collector использует standalone `InfrastructureObserver(state,pve)` и никогда
-не создаёт Engine/allocator connection. Он берёт shared nonblocking operation
-lock до чтения config/seal, отдельный collector lock и общий deadline15s; QGA
-ограничен3s. Фиксированный allowlist collector —101/1101. Новые registry VMID
-автоматически не собираются. Поздний результат, пересёкший минутную границу,
-отбрасывается; повтор одной минуты не заменяет первый sample.
+Для служебных VM collector использует standalone `InfrastructureObserver`,
+для клиентских — `AllocationObserver` с allocator mode=ro/query_only. Он никогда
+не вызывает конструкторы Engine/IPAM и не пишет в allocator. Общий production
+deadline45s включает обе группы; infra-only вызов collect сохраняет deadline15s.
+Shared nonblocking operation lock защищает чтение config/seal и каждую VM,
+отдельный collector lock исключает overlap. QGA ограничен3s. Служебный allowlist
+остаётся101/1101; новые registry VMID автоматически не собираются. Клиентские VM
+читаются из allocation, исключая зарегистрированные служебные VMID. Поздний
+результат, пересёкший минутную границу, отбрасывается; повтор одной минуты не
+заменяет первый sample.
 
 Отдельный store `/var/lib/safehost-monitoring/infrastructure-disk.sqlite3`
-содержит восемь дней минутных snapshots с ключом
-`account,vmid,node,configSha256,timestamp`. Каталог root0700, DB/WAL/SHM/lock
+содержит восемь дней минутных snapshots. Служебная таблица sample сохраняет ключ
+`account,vmid,node,configSha256,timestamp`; клиентская customer_sample описана ниже.
+Каталог root0700, DB/WAL/SHM/lock
 root0600, symlinks запрещены. Только collector создаёт/пишет/prune store.
 Исторические финансовые данные, allocations и оба root-реестра не меняются.
 
@@ -151,3 +156,38 @@ engine payload содержит только action,account,vmid,node,timeframe.
 Ansible воспроизводимо копирует оба новых модуля перед engine и unit definitions,
 но не включает timer. Scoped rollout включает его только после source/API/store
 preflight; rollback отключает timer и сохраняет monitoring DB без delete/restore.
+## Customer root filesystem monitoring
+
+Portal actions `disk_usage` and `disk_history` use the existing authenticated
+account/reference binding, then freshly check native order/client ownership.
+The root request carries only native `client_id`/`order_id` (and day/week for
+history). Root responses include those exact IDs, VMID/node and mountpoint `/`;
+the Portal validates them before echoing the trusted account/reference. Reads
+never create native orders/clients, activate services or invoke finance hooks.
+Registered infrastructure VMIDs are excluded from this customer route.
+
+`AllocationObserver` opens the allocator in SQLite mode=ro/query_only, without
+Engine or IPAM constructors. The shared allocation ownership validator preserves
+the native marker, NIC, IP/lease, storage, template/lock/hook checks. Allocation,
+lease and guest configuration are checked before and after QGA/history reads.
+Unavailable/stopped guests or missing agents return null current disk values;
+there is no SSH fallback, installation, agent enablement or VM power action.
+
+Minute customer samples live in a separate `customer_sample` table in the same
+private monitoring store. The infrastructure sample table and global schema
+version remain unchanged. Identity includes native owner/order, slot/VMID/node,
+created_at/spec and configuration fingerprint. VMID reuse or configuration
+changes cannot expose another generation's history. Unknown generation means no
+stored customer sample. Retention is eight days, including unsuccessful runs;
+history GET is read-only and does not create a missing store. Day/week grids keep
+1440/10080 step60 ticks with honest null gaps and no interpolation or backfill.
+
+The production collector explicitly includes customers, retains the infrastructure
+allowlist and excludes registered VMIDs from customer candidates. It has one
+45-second deadline (unit timeout50), one nonblocking collector lock and separate
+shared nonblocking operation locks with config/seal checks per VM. A cursor in
+the monitoring DB rotates customer attempts after interruption; samples crossing
+the minute boundary are discarded. The configured ten-slot pool fits this bounded
+schedule; exhausted budgets produce gaps. Increasing capacity requires reviewing
+the sampling budget. A fresh valid observation may drive the UI's under10% free
+warning; missing data never becomes a zero-space warning.

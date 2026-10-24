@@ -29,8 +29,9 @@ from infrastructure_observer import (InfrastructureObserver, Refused, require, s
                                      fingerprint, metrics_deadline, DEFAULT_OS, SUPPORTED_OS)
 # Load dependencies before operation.lock so imported requests remain valid during rollback.
 from infrastructure_disk_history import DiskHistory
+from allocation_observer import AllocationIdentity, AllocationObserver, DiskReadDeadline, DISK_ACTIONS
 
-METRICS_ACTIONS = ('metrics', 'infrastructure_metrics', 'infrastructure_disk', 'infrastructure_disk_history')
+METRICS_ACTIONS = ('metrics', 'infrastructure_metrics', 'infrastructure_disk', 'infrastructure_disk_history') + DISK_ACTIONS
 RESTART_SUPERSEDING_PHASES = ('stopped', 'suspended', 'blocked', 'archiving', 'archived',
                             'canceling', 'cancelled', 'purging', 'deleted')
 
@@ -276,7 +277,7 @@ print encode_json(\@rows);
         return None
 
 
-class Engine(InfrastructureObserver):
+class Engine(AllocationIdentity, InfrastructureObserver):
     def __init__(self, config, state, snippets, pve=None, *, db_timeout=30):
         self.c = config
         self.state = Path(state)
@@ -318,13 +319,6 @@ class Engine(InfrastructureObserver):
             require(not self.db.execute('SELECT 1 FROM allocation').fetchone(), 'Потерян config.sha256')
             config_hash.write_text(digest + '\n')
         self.ipam = Ipam(self.db, config.get("public_network"))
-
-    def marker(self, row):
-        return f'safehost-billing:v1:order:{row["order_id"]}:client:{row["client_id"]}:' + fingerprint(json.loads(row['spec']))
-
-    def vmid(self, row):
-        return self.c['vm_first'] + row['slot']
-
 
     def assert_mutable(self, row):
         require(self.vmid(row) not in self.infrastructure_registry(),
@@ -372,61 +366,6 @@ class Engine(InfrastructureObserver):
         require(template.get('template') and template.get('description') == marker and not template.get('lock'),
                 'Шаблон ОС не принадлежит proxmox-pilot или заблокирован')
         return template_id
-
-    def owned_config(self, row, guests=None, *, configs=None):
-        vmid = self.vmid(row)
-        guest = (guests if guests is not None else self.pve.guests()).get(vmid)
-        require(guest is not None and guest['node'] == self.c['node'] and guest['type'] == 'qemu',
-                'Управляемая VM не найдена на заданном узле')
-        cfg = self.pve.config(vmid) if configs is None else configs.get(vmid)
-        require(cfg is not None, 'Управляемая конфигурация VM не найдена')
-        require(cfg.get('description') == self.marker(row) and not cfg.get('template'),
-                'VMID занят чужой VM или изменена метка владельца')
-        require(not cfg.get('lock'), 'VM заблокирована; повторите после завершения задачи')
-        require('bridge=' + self.c['bridge'] in cfg.get('net0', '').split(','), 'Изменилась сеть VM')
-        stored = self.db.execute('SELECT phase FROM allocation WHERE order_id=?', (row['order_id'],)).fetchone()
-        effective_phase = stored['phase'] if stored else row['phase']
-        public = json.loads(row['spec']).get('network_mode') == 'public_ipv4'
-        extra_nets = {k for k in cfg if re.fullmatch(r'net[1-9]\d*', k)}
-        require(extra_nets <= ({'net1'} if public else set()), 'У VM появилась дополнительная сеть')
-        if public and row['phase'] != 'reserved':
-            lease = self.ipam.for_order(row['order_id'], row['client_id'])
-            detached = effective_phase in ('archiving', 'purging', 'canceling', 'restoring') and 'net1' not in cfg and 'ipconfig1' not in cfg
-            if lease and not detached:
-                require(cfg.get('net1') == self.public_nic(row, lease, down=True) or cfg.get('net1') == self.public_nic(row, lease), 'Изменилась публичная сеть VM')
-                expected = f'ip={lease["address"]}/{self.public_prefix()},gw={self.c["public_network"]["gateway"]}'
-                require(cfg.get('ipconfig1') == expected, 'Изменилась публичная адресация VM')
-            elif not lease:
-                require(not extra_nets and not cfg.get('ipconfig1'), 'Освобождённый адрес остался у VM')
-            require(cfg.get('net0') == self.private_nic(row), 'Изменилась приватная сеть VM')
-        require(not cfg.get('hookscript'), 'У VM появился сторонний lifecycle hook')
-        require(not any(re.fullmatch(r'(?:unused|tpmstate)\d+', k) for k in cfg), 'У VM появились неучтённые тома')
-        if row['phase'] != 'reserved':
-            ip = str(ipaddress.ip_address(self.c['ip_first']) + row['slot'])
-            fields = dict(part.split('=', 1) for part in cfg.get('ipconfig0', '').split(',') if '=' in part)
-            expected_private = {'ip': ip + '/24'} if public else {'ip': ip + '/24', 'gw': self.c['gateway']}
-            require(fields == expected_private, 'Изменилась адресация VM')
-            require(not any(re.fullmatch(r'ipconfig[1-9]\d*', k) and (not public or k != 'ipconfig1') for k in cfg), 'У VM появилась дополнительная адресация')
-        for disk in ('scsi0', 'efidisk0', 'ide2'):
-            if disk in cfg:
-                require(re.fullmatch(re.escape(self.c['storage']) + ':vm-' + str(vmid) + r'-[a-z0-9-]+',
-                                     cfg[disk].split(',')[0]), 'VM использует неожиданный том')
-        require(not any(re.fullmatch(r'(?:scsi|sata|virtio|ide)\d+', k) and k not in ('scsi0', 'ide2')
-                        for k in cfg), 'У VM появились дополнительные диски')
-        return cfg
-
-    def public_prefix(self):
-        return ipaddress.IPv4Network(self.c['public_network']['cidr']).prefixlen
-
-    def mac(self, row, nic):
-        blob = uuid.uuid5(uuid.NAMESPACE_OID, f'safehost:{row["order_id"]}:{row["client_id"]}:{nic}').bytes
-        return ':'.join(f'{x:02x}' for x in b'\x02' + blob[:5])
-
-    def private_nic(self, row):
-        return f'virtio={self.mac(row, 0)},bridge={self.c["bridge"]},firewall=0'
-
-    def public_nic(self, row, lease, down=False):
-        return f'virtio={self.mac(row, 1)},bridge={self.c["public_network"]["bridge"]},firewall=0' + (',link_down=1' if down else '')
 
     def isolate_public(self, row):
         self.assert_mutable(row)
@@ -1103,6 +1042,8 @@ class Engine(InfrastructureObserver):
                 raise Refused(str(exc)) from exc
         if action == 'monitor':
             return self.monitor()
+        if action in DISK_ACTIONS:
+            return AllocationObserver(self.state, self.pve).handle_disk(request)
         if action == 'infrastructure_disk_history':
             return self.infrastructure_disk_history(request.get('account'), request.get('vmid'), request.get('node'), request.get('timeframe'))
         if action == 'infrastructure_disk':
@@ -1218,13 +1159,20 @@ def main():
         except BlockingIOError as exc:
             raise Refused('Выполняется изменение VPS; повторите запрос') from exc
         is_metrics = request.get('action') in METRICS_ACTIONS
-        with metrics_deadline() if is_metrics else nullcontext():
+        allocation_disk = request.get('action') in DISK_ACTIONS
+        if allocation_disk:deadline = metrics_deadline(exception=DiskReadDeadline)
+        elif is_metrics:deadline = metrics_deadline()
+        else:deadline = nullcontext()
+        with deadline:
             # Config and its seal are replaced under this same lock during migrations.
             config = json.loads(Path('/etc/safehost-billing/config.json').read_text())
-            if request.get('action') == 'infrastructure_disk_history':
+            if request.get('action') in ('infrastructure_disk_history',) + DISK_ACTIONS:
                 require((state / 'config.sha256').read_text().strip() == fingerprint(config), 'Конфигурация пула изменилась')
                 observer = InfrastructureObserver(state, Proxmox(config))
-                result = observer.infrastructure_disk_history(request.get('account'), request.get('vmid'), request.get('node'), request.get('timeframe'))
+                if request.get('action') == 'infrastructure_disk_history':
+                    result = observer.infrastructure_disk_history(request.get('account'), request.get('vmid'), request.get('node'), request.get('timeframe'))
+                else:
+                    result = AllocationObserver(state, Proxmox(config)).handle_disk(request)
             else:
                 engine = Engine(config, state, '/var/lib/vz/snippets', db_timeout=1) if is_metrics else Engine(config, state, '/var/lib/vz/snippets')
                 try:
@@ -1237,6 +1185,6 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (ValueError, OSError, KeyError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
+    except (DiskReadDeadline, ValueError, OSError, KeyError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
         print(json.dumps({'ok': False, 'error': str(exc), 'code': 'refused' if isinstance(exc, Refused) else 'temporary'}, ensure_ascii=False))
         sys.exit(1)

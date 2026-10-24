@@ -108,12 +108,16 @@ final class PortalBridge
                 throw new InvalidArgumentException('Invalid identity');
             }
         }
-        if (!in_array($r['action'] ?? '', ['create', 'status', 'password', 'metrics', 'start', 'stop', 'restart', 'network_capacity','network_reserve','network_payment_pending','network_release_hold'], true)) {
+        if (!in_array($r['action'] ?? '', ['create', 'status', 'password', 'metrics', 'disk_usage', 'disk_history', 'start', 'stop', 'restart', 'network_capacity','network_reserve','network_payment_pending','network_release_hold'], true)) {
             throw new InvalidArgumentException('Invalid action');
         }
         if ($r['action'] === 'metrics' && !in_array($r['timeframe'] ?? '', ['day', 'week'], true)) {
             throw new InvalidArgumentException('Invalid metrics period');
         }
+        $diskRead = in_array($r['action'], ['disk_usage','disk_history'], true);
+        $historyPeriodInvalid = $r['action'] === 'disk_history' && !in_array($r['timeframe'] ?? null, ['day','week'], true);
+        $currentPeriodInvalid = $r['action'] === 'disk_usage' && ($r['timeframe'] ?? null) !== null;
+        if ($historyPeriodInvalid || $currentPeriodInvalid) { throw new InvalidArgumentException('Invalid disk period'); }
         if ($r['action'] === 'restart' && (!is_string($r['operation_id'] ?? null)
             || !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/D', $r['operation_id']))) {
             throw new InvalidArgumentException('Expected restart operation UUID');
@@ -138,7 +142,7 @@ final class PortalBridge
         // Writers serialize reservation and activation. Reads share the lock and refuse a busy
         // writer immediately instead of queueing a credential request behind provisioning.
         $lock = fopen($this->directory . '/operation.lock', 'c');
-        $mode = in_array($r['action'], ['status', 'password', 'metrics'], true) ? LOCK_SH | LOCK_NB : LOCK_EX;
+        $mode = in_array($r['action'], ['status', 'password', 'metrics', 'disk_usage', 'disk_history'], true) ? LOCK_SH | LOCK_NB : LOCK_EX;
         if (!$lock || !flock($lock, $mode)) { throw new RuntimeException('Bridge unavailable'); }
         try {
             $row = $this->row('SELECT * FROM orders WHERE reference=?', [$r['reference']]);
@@ -192,6 +196,22 @@ final class PortalBridge
                 $order = null;
             }
             if ($order && (int) $order['client_id'] !== $clientId) { throw new DomainException('Ownership changed'); }
+            if ($diskRead) {
+                $result = $this->foss->disk($clientId, $id, $r['action'], $r['timeframe'] ?? null);
+                $validRootIdentity = ($result['client_id'] ?? null) === $clientId && ($result['order_id'] ?? null) === $id
+                    && is_int($result['vmid'] ?? null) && $result['vmid'] > 0 && $result['vmid'] < 2147483647
+                    && is_string($result['node'] ?? null) && preg_match('/^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$/D', $result['node'])
+                    && ($result['mountpoint'] ?? null) === '/';
+                if (!$validRootIdentity) { throw new DomainException('Disk identity changed'); }
+                $currentOrder = $this->foss->get($id);
+                $currentBinding = $this->row('SELECT account,order_id FROM orders WHERE reference=?', [$r['reference']]);
+                if (!$currentBinding) { $currentBinding = $this->row('SELECT account,order_id FROM retired_orders WHERE reference=?', [$r['reference']]); }
+                $currentClient = $this->row('SELECT client_id FROM client WHERE account=?', [$r['account']]);
+                $sameBinding = $currentBinding && $currentBinding['account'] === $r['account'] && (int) $currentBinding['order_id'] === $id;
+                $sameClient = $currentClient && (int) $currentClient['client_id'] === $clientId && (int) $currentOrder['client_id'] === $clientId;
+                if (!$sameBinding || !$sameClient) { throw new DomainException('Disk ownership changed'); }
+                return array_merge($result, ['account'=>$r['account'], 'reference'=>$r['reference']]);
+            }
             if ($r['action'] === 'metrics') {
                 return $this->foss->metrics($clientId, $id, $r['timeframe']);
             }
@@ -285,6 +305,16 @@ final class FossPortal
         if ((int) $data['client_id'] !== $client) { throw new DomainException('Ownership changed'); }
         require_once __DIR__ . '/EngineGateway.php';
         return (new EngineGateway())->metrics($client, $order, $timeframe);
+    }
+    public function disk(int $client, int $order, string $action, ?string $timeframe): array
+    {
+        $data = $this->get($order);
+        if ((int) $data['client_id'] !== $client) { throw new DomainException('Ownership changed'); }
+        require_once __DIR__.'/EngineGateway.php';
+        $result = (new EngineGateway())->disk($client, $order, $action, $timeframe);
+        $current = $this->get($order);
+        if ((int) $current['client_id'] !== $client) { throw new DomainException('Ownership changed'); }
+        return $result;
     }
     public function suspend(int $id): void { $this->api->order_suspend(['id' => $id, 'reason' => 'Stopped from owner cabinet']); }
     public function unsuspend(int $id): void { $this->api->order_unsuspend(['id' => $id]); }

@@ -6,7 +6,7 @@ final class EngineGateway
 {
     private function request(array $payload): array
     {
-        $metrics = in_array($payload['action'] ?? '', ['metrics','infrastructure_metrics','infrastructure_disk','infrastructure_disk_history'], true);
+        $metrics = in_array($payload['action'] ?? '', ['metrics','infrastructure_metrics','infrastructure_disk','infrastructure_disk_history','disk_usage','disk_history'], true);
         $argv = ['/usr/bin/ssh', '-T', '-i', '/run/proxmox/id_ed25519', '-o', 'IdentitiesOnly=yes',
             '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=/run/proxmox/known_hosts',
             '-o', 'ConnectTimeout='.($metrics ? '3' : '10'), '-o', 'ServerAliveInterval='.($metrics ? '5' : '15'), '-o', 'ServerAliveCountMax=3', 'root@10.10.10.1'];
@@ -77,6 +77,17 @@ final class EngineGateway
     public function infrastructureDiskHistory(string $account, int $vmid, string $node, string $timeframe): array
     {
         return $this->request(['action'=>'infrastructure_disk_history', 'account'=>$account, 'vmid'=>$vmid, 'node'=>$node, 'timeframe'=>$timeframe]);
+    }
+    public function disk(int $client, int $order, string $action, ?string $timeframe): array
+    {
+        $history = $action === 'disk_history';
+        $unknownAction = !in_array($action, ['disk_usage','disk_history'], true);
+        $historyPeriodInvalid = $history && !in_array($timeframe, ['day','week'], true);
+        $currentPeriodInvalid = !$history && $timeframe !== null;
+        if ($unknownAction || $historyPeriodInvalid || $currentPeriodInvalid) { throw new InvalidArgumentException('Invalid disk request'); }
+        $payload = ['action'=>$action, 'client_id'=>$client, 'order_id'=>$order];
+        if ($history) { $payload['timeframe'] = $timeframe; }
+        return $this->request($payload);
     }
     public function state(int $client,int $order): array
     {

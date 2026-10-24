@@ -9,6 +9,7 @@ import sqlite3
 import stat
 import time
 from contextlib import contextmanager, closing
+from dataclasses import dataclass
 
 from infrastructure_observer import InfrastructureObserver, Refused, require, fingerprint, metrics_deadline
 
@@ -118,38 +119,71 @@ class DiskHistory:
             yield True
 
 
-def collect(observer, store=None, *, clock=time.time):
-    store = store or DiskHistory()
-    started = clock()
-    require(type(started) in (int, float) and math.isfinite(started) and started >= 0, 'Некорректное время collector')
-    tick = int(started) // 60 * 60
-    with (observer.state / 'operation.lock').open('r') as operation:
-        try:fcntl.flock(operation, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:return {'collected': 0}
-        require((observer.state / 'config.sha256').read_text().strip() == fingerprint(observer.c), 'Конфигурация пула изменилась')
-        with store.collector_lock() as acquired:
-            if not acquired:return {'collected': 0}
-            with metrics_deadline(exception=CollectionDeadline):
-                store.prune(started)
-                registry = observer.infrastructure_registry()
-                count = 0
-                for vmid in COLLECT_VMID_ALLOWLIST:
-                    current = clock()
-                    minute_expired = current >= tick + 60
-                    deadline_expired = current - started >= 15
-                    if minute_expired or deadline_expired:break
-                    entry = registry.get(vmid)
-                    if entry is None:continue
+@contextmanager
+def operation_read(observer):
+    with (observer.state/'operation.lock').open('r') as operation:
+        try:fcntl.flock(operation,fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        require((observer.state/'config.sha256').read_text().strip()==fingerprint(observer.c),'Конфигурация пула изменилась')
+        yield True
+
+
+@dataclass(frozen=True)
+class CollectionTarget:
+    vmid: int | None = None
+    client: int | None = None
+    order: int | None = None
+
+
+def collect(observer, store=None, *, clock=time.time, include_customers=False):
+    from allocation_observer import AllocationObserver, CustomerDiskHistory
+    store=store or DiskHistory()
+    customer_store=CustomerDiskHistory(store.path)
+    customers=observer if isinstance(observer,AllocationObserver) else AllocationObserver(observer.state,observer.pve)
+    started=clock()
+    require(type(started) in (int,float) and math.isfinite(started) and started>=0,'Некорректное время collector')
+    tick=int(started)//60*60
+    with operation_read(observer) as acquired:
+        if not acquired:return {'collected':0}
+    with store.collector_lock() as acquired:
+        if not acquired:return {'collected':0}
+        deadline=metrics_deadline(seconds=45,exception=CollectionDeadline) if include_customers else metrics_deadline(exception=CollectionDeadline)
+        with deadline:
+            store.prune(started)
+            if include_customers:customer_store.prune_customers(started)
+            # Retention is independent of target discovery, including refused identities.
+            with operation_read(observer) as acquired:
+                if not acquired:return {'collected':0}
+                registry=observer.infrastructure_registry()
+                candidates=customers.candidates() if include_customers else []
+            targets=[CollectionTarget(vmid=vmid) for vmid in COLLECT_VMID_ALLOWLIST if vmid in registry]
+            targets += [CollectionTarget(client=client,order=order) for client,order in customer_store.customer_order(candidates)]
+            count=0
+            for target in targets:
+                current=clock()
+                minute_expired=current>=tick+60
+                deadline_expired=current-started>=(45 if include_customers else 15)
+                if minute_expired or deadline_expired:break
+                with operation_read(observer) as acquired:
+                    if not acquired:continue
+                    if target.order is not None:customer_store.attempted(target.order)
                     try:
-                        observation = observer.infrastructure_disk(entry['account'], vmid, entry['node'])
-                        require(observer.infrastructure_registry().get(vmid) == entry, 'Изменилась регистрация перед сохранением')
+                        if target.order is None:
+                            entry=registry[target.vmid]
+                            observation=observer.infrastructure_disk(entry['account'],target.vmid,entry['node'])
+                            require(observer.infrastructure_registry().get(target.vmid)==entry,'Изменилась регистрация перед сохранением')
+                        else:
+                            observation,entry=customers.observe_disk(target.client,target.order)
                     except TimeoutError:raise
-                    except (Refused, OSError):continue
-                    observed = clock()
-                    if int(observed) // 60 * 60 != tick:continue
-                    store.record(entry, tick, observation['usedBytes'], observation['totalBytes'], now=observed)
-                    count += 1
-                return {'collected': count}
+                    except (Refused,OSError):continue
+                    observed=clock()
+                    if int(observed)//60*60!=tick:continue
+                    if target.order is None:store.record(entry,tick,observation['usedBytes'],observation['totalBytes'],now=observed)
+                    else:customer_store.record_customer(entry,tick,observation['usedBytes'],observation['totalBytes'],now=observed)
+                    count+=1
+            return {'collected':count}
 
 
 def main():
@@ -165,8 +199,8 @@ def main():
             return
         config = json.loads(Path('/etc/safehost-billing/config.json').read_text())
         require((state / 'config.sha256').read_text().strip() == fingerprint(config), 'Конфигурация пула изменилась')
-        try:result = collect(InfrastructureObserver(state, Proxmox(config)))
-        except CollectionDeadline:raise SystemExit('Disk collection deadline exceeded')
+    try:result = collect(InfrastructureObserver(state, Proxmox(config)), include_customers=True)
+    except CollectionDeadline:raise SystemExit('Disk collection deadline exceeded')
     print(json.dumps(result))
 
 
